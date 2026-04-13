@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
@@ -24,6 +27,7 @@ const ERROR_OPTION_NEGOTIATION: u16 = 8;
 const DEFAULT_BLOCK_SIZE: u16 = 512;
 const MAX_BLOCK_SIZE: u16 = 65_464;
 const DEFAULT_TIMEOUT_SECS: u16 = 5;
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Static server configuration for the read-only TFTP service.
 #[derive(Debug, Clone)]
@@ -46,6 +50,7 @@ impl TftpServer {
             IpAddr::V4(config.bind_ip),
             config.bind_port,
         ))?;
+        socket.set_read_timeout(Some(SHUTDOWN_POLL_INTERVAL))?;
         Ok(Self {
             socket,
             file_map: Arc::new(config.file_map),
@@ -62,6 +67,21 @@ impl TftpServer {
         loop {
             self.serve_once()?;
         }
+    }
+
+    /// Process incoming requests until shutdown is requested.
+    pub fn serve_until_shutdown(&self, shutdown: &Arc<AtomicBool>) -> io::Result<()> {
+        while !shutdown.load(Ordering::SeqCst) {
+            match self.serve_once() {
+                Ok(()) => {}
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
     }
 
     /// Process a single incoming request packet.

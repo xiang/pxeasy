@@ -4,5 +4,6 @@ members = [
     "crates/pxe-profiles",
     "crates/pxe-dhcp",
     "crates/pxe-tftp",
+    "crates/pxeasy",
 ]
 resolver = "2"

@@ -34,6 +34,8 @@ CLI (pxeasy)
 
 Only `pxe-proto` is implemented so far (Phase 1). The remaining crates are defined in `.docs/` specs and will be added as workspace members in implementation order.
 
+Primary platform target is modern UEFI hardware, with arm64 support treated as first-class alongside x86_64. Legacy BIOS support is lower priority than getting the UEFI boot path working cleanly on current hardware and VMs.
+
 ### `pxe-proto` (implemented)
 
 Pure DHCP/PXE packet parsing and serialization. No I/O, no async, no external crates in production code (`std`-only). Key invariants:
@@ -50,7 +52,7 @@ Option 43 (`VendorSpecific`) is stored as raw bytes in `DhcpOption` and decoded 
 - **`pxe-dhcp`** (Phase 3): ProxyDHCP only — injects boot params, never assigns IPs. The `build_offer`/`build_ack` pure functions are the primary test target; option 43 content is the #1 real-world failure point.
 - **`pxe-tftp`** (Phase 4): Read-only TFTP serving `ipxe.efi` and `boot.ipxe` from an in-memory `HashMap<String, Bytes>`.
 - **`pxe-http`** (Phase 6): HTTP serving kernel/initrd from ISO; must support range requests (iPXE requires them).
-- **`pxeasy` CLI** (Phase 5): `pxeasy start <iso-path> [--interface <iface>] [--bind <ip>]` — wires all services together.
+- **`pxeasy` CLI** (Phase 5): `pxeasy start <iso-path> [--interface <iface>] [--bind <ip>]` — wires ProxyDHCP and TFTP together for the first boot to the iPXE prompt. HTTP integration follows in Phase 6.
 
 ## Code standards
 

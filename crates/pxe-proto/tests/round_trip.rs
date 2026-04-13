@@ -145,7 +145,9 @@ proptest! {
                 prop::collection::vec(any::<u8>(), 0..16usize)
                     .prop_map(DhcpOption::VendorClassIdentifier),
                 (any::<u8>(), prop::collection::vec(any::<u8>(), 0..8usize))
-                    .prop_filter("not pad/end tags", |(t, _)| *t != 0 && *t != 255)
+                    .prop_filter("unknown tags only", |(t, _)| {
+                        !matches!(*t, 0 | 43 | 53 | 54 | 55 | 60 | 66 | 67 | 255)
+                    })
                     .prop_map(|(t, d)| DhcpOption::Unknown(t, d)),
             ],
             0..5,

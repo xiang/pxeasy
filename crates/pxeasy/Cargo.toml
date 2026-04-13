@@ -1,0 +1,12 @@
+[package]
+name = "pxeasy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1"
+ctrlc = "3"
+if-addrs = "0.13"
+pxe-dhcp = { path = "../pxe-dhcp" }
+pxe-profiles = { path = "../pxe-profiles" }
+pxe-tftp = { path = "../pxe-tftp" }
