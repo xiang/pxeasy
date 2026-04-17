@@ -3,7 +3,12 @@ members = [
     "crates/pxe-proto",
     "crates/pxe-profiles",
     "crates/pxe-dhcp",
+    "crates/pxe-http",
+    "crates/pxe-iscsi",
+    "crates/pxe-nbd",
+    "crates/pxe-nfs",
     "crates/pxe-tftp",
     "crates/pxeasy",
+    "crates/pxe-qemu",
 ]
 resolver = "2"
