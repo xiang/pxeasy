@@ -1,0 +1,11 @@
+[package]
+name = "pxe-harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+ctrlc = "3"
+pico-args = "0.5"
+pxe-qemu = { path = "../pxe-qemu" }
+tempfile = "3"
