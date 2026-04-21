@@ -1,10 +1,13 @@
 pub mod boot;
 pub mod network;
 pub mod services;
+mod wim;
 
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
@@ -21,16 +24,24 @@ pub use network::{resolve_network, NetworkSelection};
 use pxe_http::HttpAsset;
 use pxe_nfs::{NfsConfig, NfsServer};
 use pxe_profiles::{
-    detect_profile, load_all_files, load_file, load_file_slice, ubuntu, BootProfile, BootSource,
-    ProfileError,
+    detect_profile, load_all_files, load_file, load_file_slice, ubuntu, BootProfile, LinuxProfile,
+    ProfileError, WindowsProfile,
 };
 pub use pxe_profiles::{Architecture, BootSourceKind};
 use pxe_smb::{SmbConfig, SmbServer};
 use services::{CoreServers, DhcpBoot, ServiceRunner};
+use wim::Wim;
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_SMB_PORT: u16 = 445;
 const WINDOWS_SHARE_NAME: &str = "windows";
+const WINDOWS_SOURCE_WINPE_IMAGE: i32 = 1;
+const WINDOWS_CUSTOM_WINPE_IMAGE: i32 = 1;
+const WINDOWS_VIRTIO_ROOT: &str = "/Users/sfortner/work/lab/pxeasy/assets/windows/virtio-win";
+const WINDOWS_STARTNET_TEMPLATE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/windows/startnet.cmd"
+);
 
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -98,9 +109,9 @@ impl Drop for RuntimeSession {
 pub fn inspect_source(source_path: &Path) -> Result<ResolvedSource, String> {
     let profile = resolve_profile(source_path)?;
     Ok(ResolvedSource {
-        label: profile.label,
-        architecture: profile.architecture,
-        source_kind: profile.source_kind,
+        label: profile.label().to_string(),
+        architecture: profile.architecture(),
+        source_kind: profile.source_kind(),
     })
 }
 
@@ -108,77 +119,33 @@ pub fn start(request: LaunchRequest) -> Result<RuntimeSession, String> {
     let network = resolve_network(request.interface.as_deref(), request.bind_ip)?;
     let profile = resolve_profile(&request.source_path)?;
 
-    match profile.source_kind {
-        BootSourceKind::UbuntuLiveIso => run_nfs_start(
+    match profile {
+        BootProfile::Linux(profile) => match profile.source_kind {
+            BootSourceKind::UbuntuLiveIso => run_nfs_start(
+                request.source_path,
+                request.ipxe_boot_file,
+                network,
+                profile,
+            ),
+            BootSourceKind::FreeBSDBootOnly => run_freebsd_start(
+                request.source_path,
+                request.ipxe_boot_file,
+                network,
+                profile,
+            ),
+            _ => run_http_start(
+                request.source_path,
+                request.ipxe_boot_file,
+                network,
+                profile,
+            ),
+        },
+        BootProfile::Windows(profile) => run_windows_start(
             request.source_path,
             request.ipxe_boot_file,
             network,
             profile,
         ),
-        BootSourceKind::FreeBSDBootOnly => run_freebsd_start(
-            request.source_path,
-            request.ipxe_boot_file,
-            network,
-            profile,
-        ),
-        BootSourceKind::WindowsIso => run_windows_start(
-            request.source_path,
-            request.ipxe_boot_file,
-            network,
-            profile,
-        ),
-        _ => run_http_start(
-            request.source_path,
-            request.ipxe_boot_file,
-            network,
-            profile,
-        ),
-    }
-}
-
-struct LinuxBootSource<'a> {
-    kernel_path: &'a str,
-    initrd_path: &'a str,
-    boot_params: &'a str,
-}
-
-struct WindowsBootSource<'a> {
-    bootmgr_path: &'a str,
-    bcd_path: &'a str,
-    boot_sdi_path: &'a str,
-    boot_wim_path: &'a str,
-}
-
-fn linux_boot_source(profile: &BootProfile) -> Result<LinuxBootSource<'_>, String> {
-    match &profile.source {
-        BootSource::Linux {
-            kernel_path,
-            initrd_path,
-            boot_params,
-        } => Ok(LinuxBootSource {
-            kernel_path,
-            initrd_path,
-            boot_params,
-        }),
-        _ => Err("error: boot source does not provide Linux kernel/initrd metadata".to_string()),
-    }
-}
-
-fn windows_boot_source(profile: &BootProfile) -> Result<WindowsBootSource<'_>, String> {
-    match &profile.source {
-        BootSource::Windows {
-            bootmgr_path,
-            bcd_path,
-            boot_sdi_path,
-            boot_wim_path,
-            ..
-        } => Ok(WindowsBootSource {
-            bootmgr_path,
-            bcd_path,
-            boot_sdi_path,
-            boot_wim_path,
-        }),
-        _ => Err("error: boot source does not provide Windows boot metadata".to_string()),
     }
 }
 
@@ -186,13 +153,12 @@ fn run_http_start(
     source_path: PathBuf,
     ipxe_boot_file: Option<String>,
     network: NetworkSelection,
-    profile: BootProfile,
+    profile: LinuxProfile,
 ) -> Result<RuntimeSession, String> {
     let arch = require_known_architecture(profile.architecture)?;
     let serial_console = arch
         .serial_console()
         .ok_or_else(|| "error: unsupported serial console for architecture: unknown".to_string())?;
-    let linux = linux_boot_source(&profile)?;
 
     let file_bytes: HashMap<String, Bytes> = load_all_files(&source_path)
         .map_err(|err| profile_error(&source_path, err))?
@@ -201,12 +167,12 @@ fn run_http_start(
         .collect();
 
     let kernel = file_bytes
-        .get(linux.kernel_path)
-        .ok_or_else(|| format!("error: kernel not found at {}", linux.kernel_path))?
+        .get(profile.kernel_path.as_str())
+        .ok_or_else(|| format!("error: kernel not found at {}", profile.kernel_path))?
         .clone();
     let initrd = file_bytes
-        .get(linux.initrd_path)
-        .ok_or_else(|| format!("error: initrd not found at {}", linux.initrd_path))?
+        .get(profile.initrd_path.as_str())
+        .ok_or_else(|| format!("error: initrd not found at {}", profile.initrd_path))?
         .clone();
 
     let mut assets = HashMap::new();
@@ -220,7 +186,7 @@ fn run_http_start(
     add_binary_asset(&mut assets, "/boot/linux", kernel);
     add_binary_asset(&mut assets, "/boot/initrd", initrd);
 
-    let mut boot_params = linux.boot_params.to_string();
+    let mut boot_params = profile.boot_params.clone();
     if !boot_params.contains("console=") {
         if !boot_params.is_empty() {
             boot_params.push(' ');
@@ -252,7 +218,7 @@ fn run_nfs_start(
     source_path: PathBuf,
     ipxe_boot_file: Option<String>,
     network: NetworkSelection,
-    profile: BootProfile,
+    profile: LinuxProfile,
 ) -> Result<RuntimeSession, String> {
     if !is_iso(&source_path) {
         return Err("error: Ubuntu live ISO boot requires an ISO source".to_string());
@@ -262,11 +228,9 @@ fn run_nfs_start(
     let serial_console = arch
         .serial_console()
         .ok_or_else(|| "error: unsupported serial console for architecture: unknown".to_string())?;
-    let linux = linux_boot_source(&profile)?;
-
-    let kernel = load_file(&source_path, linux.kernel_path)
+    let kernel = load_file(&source_path, &profile.kernel_path)
         .map_err(|err| profile_error(&source_path, err))?;
-    let initrd = load_file(&source_path, linux.initrd_path)
+    let initrd = load_file(&source_path, &profile.initrd_path)
         .map_err(|err| profile_error(&source_path, err))?;
 
     let nfs_export_path = "/";
@@ -337,7 +301,7 @@ fn run_freebsd_start(
     source_path: PathBuf,
     ipxe_boot_file: Option<String>,
     network: NetworkSelection,
-    profile: BootProfile,
+    profile: LinuxProfile,
 ) -> Result<RuntimeSession, String> {
     if !is_freebsd_boot_image(&source_path) {
         return Err("error: FreeBSD boot requires an ISO or memstick disk image".to_string());
@@ -384,7 +348,7 @@ fn run_freebsd_iso_start(
     source_path: PathBuf,
     ipxe_boot_file: Option<String>,
     network: NetworkSelection,
-    profile: BootProfile,
+    profile: LinuxProfile,
 ) -> Result<RuntimeSession, String> {
     let arch = require_known_architecture(profile.architecture)?;
     let boot_filename = profile.efi_path.clone();
@@ -574,40 +538,31 @@ fn run_windows_start(
     source_path: PathBuf,
     ipxe_boot_file: Option<String>,
     network: NetworkSelection,
-    profile: BootProfile,
+    profile: WindowsProfile,
 ) -> Result<RuntimeSession, String> {
     let arch = require_known_architecture(profile.architecture)?;
-    if arch != Architecture::Amd64 {
-        return Err(
-            "error: Windows PXE currently supports x86_64 UEFI only; arm64 Windows PXE is not supported"
-                .to_string(),
-        );
-    }
-
-    ensure_wimlib_available()?;
-    let windows = windows_boot_source(&profile)?;
-    let cached_wimboot = fetch_wimboot()?;
+    let cached_wimboot = fetch_wimboot(arch)?;
     let prepared_boot_wim =
-        prepare_windows_boot_wim(&source_path, windows.boot_wim_path, network.ip)?;
+        prepare_windows_boot_wim(&source_path, &profile.boot_wim_path, network.ip, arch)?;
 
     let mut assets = HashMap::new();
     add_windows_iso_asset(
         &mut assets,
         &source_path,
         "/windows/bootmgr",
-        windows.bootmgr_path,
+        &profile.bootmgr_path,
     )?;
     add_windows_iso_asset(
         &mut assets,
         &source_path,
         "/windows/boot/bcd",
-        windows.bcd_path,
+        &profile.bcd_path,
     )?;
     add_windows_iso_asset(
         &mut assets,
         &source_path,
         "/windows/boot/boot.sdi",
-        windows.boot_sdi_path,
+        &profile.boot_sdi_path,
     )?;
     assets.insert(
         "/windows/wimboot".to_string(),
@@ -820,17 +775,30 @@ fn add_windows_iso_asset(
     http_path: &str,
     iso_path: &str,
 ) -> Result<(), String> {
-    let slice =
-        load_file_slice(source_path, iso_path).map_err(|err| profile_error(source_path, err))?;
-    assets.insert(
-        http_path.to_string(),
-        HttpAsset::IsoSlice {
-            content_type: "application/octet-stream",
-            path: source_path.to_path_buf(),
-            offset: slice.offset,
-            length: slice.length,
-        },
-    );
+    match load_file_slice(source_path, iso_path) {
+        Ok(slice) => {
+            assets.insert(
+                http_path.to_string(),
+                HttpAsset::IsoSlice {
+                    content_type: "application/octet-stream",
+                    path: source_path.to_path_buf(),
+                    offset: slice.offset,
+                    length: slice.length,
+                },
+            );
+        }
+        Err(_) => {
+            let bytes =
+                load_file(source_path, iso_path).map_err(|err| profile_error(source_path, err))?;
+            assets.insert(
+                http_path.to_string(),
+                HttpAsset::Memory {
+                    content_type: "application/octet-stream",
+                    data: Bytes::from(bytes),
+                },
+            );
+        }
+    }
     Ok(())
 }
 
@@ -840,29 +808,11 @@ fn build_windows_ipxe_script(bind_ip: Ipv4Addr, http_port: u16) -> String {
     )
 }
 
-fn ensure_wimlib_available() -> Result<(), String> {
-    let status = Command::new("wimlib-imagex")
-        .arg("--version")
-        .status()
-        .map_err(|_| {
-            "error: wimlib-imagex required for Windows boot — install with: brew install wimlib"
-                .to_string()
-        })?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(
-            "error: wimlib-imagex required for Windows boot — install with: brew install wimlib"
-                .to_string(),
-        )
-    }
-}
-
 fn prepare_windows_boot_wim(
     source_path: &Path,
     boot_wim_path: &str,
     server_ip: Ipv4Addr,
+    arch: Architecture,
 ) -> Result<PathBuf, String> {
     let source_metadata = fs::metadata(source_path)
         .map_err(|err| format!("error: failed to stat {}: {err}", source_path.display()))?;
@@ -874,6 +824,8 @@ fn prepare_windows_boot_wim(
         .map_err(|err| format!("error: failed to normalize ISO mtime: {err}"))?
         .as_secs();
 
+    let virtio_drivers = windows_virtio_drivers(arch)?;
+    let startnet_script = windows_startnet_cmd(server_ip, &virtio_drivers)?;
     let cache_dir = PathBuf::from(format!("{}.pxeasy", source_path.display()));
     fs::create_dir_all(&cache_dir)
         .map_err(|err| format!("error: failed to create Windows cache dir: {err}"))?;
@@ -881,8 +833,11 @@ fn prepare_windows_boot_wim(
     let cached_wim = cache_dir.join("boot.wim");
     let cached_meta = cache_dir.join("boot.wim.meta");
     let expected_meta = format!(
-        "size={}\nmtime={modified_secs}\nserver_ip={server_ip}\n",
-        source_metadata.len()
+        "size={}\nmtime={modified_secs}\nserver_ip={server_ip}\narch={}\nvirtio_drivers={}\nstartnet_hash={:016x}\n",
+        source_metadata.len(),
+        arch.slug().unwrap_or("unknown"),
+        windows_virtio_meta(&virtio_drivers),
+        stable_hash(&startnet_script)
     );
 
     if cached_wim.exists() {
@@ -897,31 +852,31 @@ fn prepare_windows_boot_wim(
         .map_err(|err| format!("error: failed to create temporary directory: {err}"))?;
     let temp_boot_wim = tempdir.path().join("boot.wim");
     let startnet_cmd = tempdir.path().join("startnet.cmd");
+    let source_boot_wim = tempdir.path().join("source-boot.wim");
     let boot_wim_bytes =
         load_file(source_path, boot_wim_path).map_err(|err| profile_error(source_path, err))?;
 
-    fs::write(&temp_boot_wim, boot_wim_bytes)
-        .map_err(|err| format!("error: failed to write temporary boot.wim: {err}"))?;
-    fs::write(&startnet_cmd, windows_startnet_cmd(server_ip))
+    fs::write(&source_boot_wim, boot_wim_bytes)
+        .map_err(|err| format!("error: failed to write temporary source boot.wim: {err}"))?;
+    fs::write(&startnet_cmd, startnet_script)
         .map_err(|err| format!("error: failed to write startnet.cmd: {err}"))?;
 
-    let command = format!(
-        "add {} /Windows/System32/startnet.cmd",
-        startnet_cmd.display()
-    );
-    let status = Command::new("wimlib-imagex")
-        .arg("update")
-        .arg(&temp_boot_wim)
-        .arg("2")
-        .arg("--command")
-        .arg(command)
-        .status()
-        .map_err(|err| format!("error: failed to run wimlib-imagex: {err}"))?;
-    if !status.success() {
-        return Err(format!(
-            "error: wimlib-imagex failed to prepare Windows boot.wim: {status}"
-        ));
+    Wim::export_image_to_new_wim(&source_boot_wim, WINDOWS_SOURCE_WINPE_IMAGE, &temp_boot_wim)?;
+
+    let mut wim = Wim::open_for_update(&temp_boot_wim)?;
+    wim.replace_file(
+        WINDOWS_CUSTOM_WINPE_IMAGE,
+        &startnet_cmd,
+        "/Windows/System32/startnet.cmd",
+    )?;
+    for driver in &virtio_drivers {
+        wim.add_tree(
+            WINDOWS_CUSTOM_WINPE_IMAGE,
+            &driver.host_dir,
+            &driver.wim_dir,
+        )?;
     }
+    wim.overwrite()?;
 
     fs::copy(&temp_boot_wim, &cached_wim)
         .map_err(|err| format!("error: failed to cache prepared boot.wim: {err}"))?;
@@ -931,18 +886,160 @@ fn prepare_windows_boot_wim(
     Ok(cached_wim)
 }
 
-fn windows_startnet_cmd(server_ip: Ipv4Addr) -> String {
-    format!(
-        "@echo off\r\nwpeinit\r\nnet use Z: \\\\{server_ip}\\{WINDOWS_SHARE_NAME} /persistent:no\r\nZ:\\setup.exe\r\n"
-    )
+fn windows_startnet_cmd(
+    server_ip: Ipv4Addr,
+    virtio_drivers: &[WindowsVirtioDriver],
+) -> Result<String, String> {
+    let template = fs::read_to_string(WINDOWS_STARTNET_TEMPLATE).map_err(|err| {
+        format!(
+            "error: failed to read Windows startnet template at {}: {err}",
+            WINDOWS_STARTNET_TEMPLATE
+        )
+    })?;
+
+    let mut drvload_lines = String::new();
+    for driver in virtio_drivers {
+        for inf_path in &driver.inf_paths {
+            drvload_lines.push_str(&format!("drvload X:{inf_path}\n"));
+        }
+    }
+
+    let script = template
+        .replace("{{DRVLOAD_LINES}}", &drvload_lines)
+        .replace("{{SERVER_IP}}", &server_ip.to_string())
+        .replace("{{SHARE_NAME}}", WINDOWS_SHARE_NAME);
+
+    Ok(script.replace("\r\n", "\n").replace('\n', "\r\n"))
 }
 
-fn fetch_wimboot() -> Result<PathBuf, String> {
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct WindowsVirtioDriver {
+    host_dir: PathBuf,
+    wim_dir: String,
+    inf_paths: Vec<String>,
+}
+
+fn windows_virtio_drivers(arch: Architecture) -> Result<Vec<WindowsVirtioDriver>, String> {
+    if arch != Architecture::Arm64 {
+        return Ok(Vec::new());
+    }
+
+    let root = PathBuf::from(WINDOWS_VIRTIO_ROOT);
+    if !root.is_dir() {
+        return Err(format!(
+            "error: expected virtio driver root at {}",
+            root.display()
+        ));
+    }
+
+    let mut drivers = Vec::new();
+    let entries = fs::read_dir(&root)
+        .map_err(|err| format!("error: failed to read virtio driver root: {err}"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("error: failed to read virtio driver entry: {err}"))?;
+        if !entry
+            .file_type()
+            .map_err(|err| format!("error: failed to stat virtio driver entry: {err}"))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let host_dir = entry.path().join("w11").join("ARM64");
+        if !host_dir.is_dir() {
+            continue;
+        }
+
+        let driver_name = entry.file_name().to_string_lossy().into_owned();
+        let mut inf_paths = Vec::new();
+        let driver_entries = fs::read_dir(&host_dir).map_err(|err| {
+            format!(
+                "error: failed to read ARM64 driver dir {}: {err}",
+                host_dir.display()
+            )
+        })?;
+        for driver_entry in driver_entries {
+            let driver_entry = driver_entry
+                .map_err(|err| format!("error: failed to read ARM64 driver entry: {err}"))?;
+            let path = driver_entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_inf = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("inf"));
+            if !is_inf {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("error: non-UTF-8 INF path: {}", path.display()))?;
+            inf_paths.push(format!("/Drivers/{driver_name}/{file_name}"));
+        }
+
+        if inf_paths.is_empty() {
+            continue;
+        }
+        inf_paths.sort();
+
+        drivers.push(WindowsVirtioDriver {
+            host_dir,
+            wim_dir: format!("/Drivers/{driver_name}"),
+            inf_paths,
+        });
+    }
+
+    drivers.sort_by(|left, right| left.wim_dir.cmp(&right.wim_dir));
+    if drivers.is_empty() {
+        return Err(format!(
+            "error: no ARM64 virtio driver directories found under {}",
+            root.display()
+        ));
+    }
+
+    Ok(drivers)
+}
+
+fn windows_virtio_meta(drivers: &[WindowsVirtioDriver]) -> String {
+    if drivers.is_empty() {
+        return "none".to_string();
+    }
+
+    drivers
+        .iter()
+        .map(|driver| driver.host_dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn fetch_wimboot(arch: Architecture) -> Result<PathBuf, String> {
     let cache_dir = pxeasy_cache_dir()?.join("cache");
     fs::create_dir_all(&cache_dir)
         .map_err(|err| format!("error: failed to create wimboot cache dir: {err}"))?;
 
-    let cached_wimboot = cache_dir.join("wimboot");
+    let (filename, url) = match arch {
+        Architecture::Unknown => {
+            return Err("error: unsupported wimboot architecture: unknown".to_string());
+        }
+        Architecture::Amd64 => (
+            "wimboot",
+            "https://github.com/ipxe/wimboot/releases/latest/download/wimboot",
+        ),
+        Architecture::Arm64 => (
+            "wimboot.arm64",
+            "https://github.com/ipxe/wimboot/releases/latest/download/wimboot.arm64",
+        ),
+    };
+
+    let cached_wimboot = cache_dir.join(filename);
     if cached_wimboot.exists() {
         return Ok(cached_wimboot);
     }
@@ -951,12 +1048,7 @@ fn fetch_wimboot() -> Result<PathBuf, String> {
         .to_str()
         .ok_or("error: wimboot cache path contains non-UTF-8 characters")?;
     let status = Command::new("curl")
-        .args([
-            "-fsSL",
-            "https://github.com/ipxe/wimboot/releases/latest/download/wimboot",
-            "-o",
-            output_path,
-        ])
+        .args(["-fsSL", url, "-o", output_path])
         .status()
         .map_err(|err| format!("error: failed to spawn curl for wimboot download: {err}"))?;
     if !status.success() {

@@ -1,0 +1,7 @@
+[package]
+name = "pxeasy-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pxeasy-runtime = { path = "../pxeasy-runtime" }

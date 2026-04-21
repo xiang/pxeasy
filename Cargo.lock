@@ -200,6 +200,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "config"
+version = "0.15.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e68cfe19cd7d23ffde002c24ffa5cda73931913ef394d5eaaa32037dc940c0c"
+dependencies = [
+ "pathdiff",
+ "serde_core",
+ "toml",
+ "winnow",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,6 +621,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "pico-args"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
+
+[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -697,6 +721,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pxe-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "pico-args",
+ "pxe-qemu",
+ "tempfile",
+]
+
+[[package]]
 name = "pxe-http"
 version = "0.1.0"
 dependencies = [
@@ -706,14 +741,6 @@ dependencies = [
 
 [[package]]
 name = "pxe-iscsi"
-version = "0.1.0"
-dependencies = [
- "log",
- "tempfile",
-]
-
-[[package]]
-name = "pxe-nbd"
 version = "0.1.0"
 dependencies = [
  "log",
@@ -753,6 +780,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pxe-smb"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "pxe-profiles",
+]
+
+[[package]]
 name = "pxe-tftp"
 version = "0.1.0"
 dependencies = [
@@ -764,22 +799,36 @@ dependencies = [
 name = "pxeasy"
 version = "0.1.0"
 dependencies = [
- "bytes",
+ "config",
  "ctrlc",
  "env_logger",
+ "pico-args",
+ "pxeasy-core",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "pxeasy-core"
+version = "0.1.0"
+dependencies = [
+ "pxeasy-runtime",
+]
+
+[[package]]
+name = "pxeasy-runtime"
+version = "0.1.0"
+dependencies = [
+ "bytes",
  "if-addrs",
  "log",
  "pxe-dhcp",
  "pxe-http",
- "pxe-iscsi",
- "pxe-nbd",
  "pxe-nfs",
  "pxe-profiles",
- "pxe-qemu",
+ "pxe-smb",
  "pxe-tftp",
- "serde",
  "tempfile",
- "toml",
 ]
 
 [[package]]
@@ -1087,24 +1136,22 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.9.12+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
 dependencies = [
- "indexmap",
  "serde_core",
  "serde_spanned",
  "toml_datetime",
  "toml_parser",
- "toml_writer",
- "winnow 0.7.15",
+ "winnow",
 ]
 
 [[package]]
 name = "toml_datetime"
-version = "0.7.5+spec-1.1.0"
+version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
 ]
@@ -1115,14 +1162,8 @@ version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
- "winnow 1.0.1",
+ "winnow",
 ]
-
-[[package]]
-name = "toml_writer"
-version = "1.1.1+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "unarray"
@@ -1387,15 +1428,12 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
-
-[[package]]
-name = "winnow"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"
