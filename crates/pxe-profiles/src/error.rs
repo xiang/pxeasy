@@ -4,7 +4,7 @@ use std::{fmt, io, path::PathBuf};
 pub enum ProfileError {
     /// The boot media source could not be opened or parsed.
     SourceUnreadable(PathBuf, io::Error),
-    /// No supported distro was detected in the source.
+    /// No supported platform was detected in the source.
     UnknownDistro,
     /// A file that must exist inside the source for the detected distro is absent.
     MissingFile { path: String },
@@ -17,7 +17,7 @@ impl fmt::Display for ProfileError {
                 write!(f, "boot source unreadable at {}: {}", path.display(), err)
             }
             ProfileError::UnknownDistro => {
-                write!(f, "no supported distro detected in boot source")
+                write!(f, "no supported platform detected in boot source")
             }
             ProfileError::MissingFile { path } => {
                 write!(f, "expected file missing from boot source: {}", path)

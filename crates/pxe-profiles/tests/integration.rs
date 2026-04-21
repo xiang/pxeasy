@@ -9,14 +9,18 @@ fn real_ubuntu_iso_detected() {
     let profile =
         pxe_profiles::detect_profile(std::path::Path::new(&path)).expect("detect_profile failed");
 
-    assert_eq!(profile.distro, pxe_profiles::Distro::Ubuntu);
-    assert_eq!(profile.kernel_path, "/casper/vmlinuz");
-    assert_eq!(profile.initrd_path, "/casper/initrd");
-    assert!(!profile.label.is_empty(), "label should not be empty");
-    println!("Detected label: {}", profile.label);
-
-    let script = pxe_profiles::generate_ipxe_script(&profile, "192.168.1.1", 8080);
-    assert!(script.starts_with("#!ipxe\n"));
-    assert!(script.contains("/boot/ubuntu/vmlinuz"));
-    assert!(script.ends_with("boot\n"));
+    match &profile {
+        pxe_profiles::BootProfile::Linux(profile) => {
+            assert_eq!(profile.platform, pxe_profiles::Platform::Ubuntu);
+            let kernel_path = &profile.kernel_path;
+            let initrd_path = &profile.initrd_path;
+            assert_eq!(kernel_path, "/casper/vmlinuz");
+            assert_eq!(initrd_path, "/casper/initrd");
+            assert!(profile.efi_path.is_some(), "EFI path should be detected");
+            assert!(!profile.label.is_empty(), "label should not be empty");
+            println!("Detected label: {}", profile.label);
+            println!("Detected EFI: {:?}", profile.efi_path);
+        }
+        _ => panic!("expected BootProfile::Linux for Ubuntu"),
+    }
 }

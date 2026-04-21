@@ -12,14 +12,16 @@ pub use error::ProfileError;
 mod error;
 mod freebsd;
 pub mod ubuntu;
+mod udf;
+mod windows;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// The detected distribution / OS family.
+/// The detected platform / OS family.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Distro {
+pub enum Platform {
     Ubuntu,
     Debian,
     FreeBSD,
@@ -64,34 +66,65 @@ impl Architecture {
     }
 }
 
-/// Boot-source-specific metadata, discriminated by OS type.
 #[derive(Debug, Clone)]
-pub enum BootSource {
-    Linux {
-        kernel_path: String,
-        initrd_path: String,
-        boot_params: String,
-    },
-    Windows {
-        bootmgr_path: String,
-        bcd_path: String,
-        boot_sdi_path: String,
-        boot_wim_path: String,
-        install_wim_path: String,
-    },
-}
-
-/// A boot profile derived from inspecting an ISO image.
-#[derive(Debug, Clone)]
-pub struct BootProfile {
-    pub distro: Distro,
+pub struct LinuxProfile {
+    pub platform: Platform,
     pub source_kind: BootSourceKind,
     pub architecture: Architecture,
-    pub source: BootSource,
-    /// Path to the EFI loader within the ISO (if any).
     pub efi_path: Option<String>,
-    /// Human-readable label, e.g. "Ubuntu 24.04 LTS".
     pub label: String,
+    pub kernel_path: String,
+    pub initrd_path: String,
+    pub boot_params: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowsProfile {
+    pub source_kind: BootSourceKind,
+    pub architecture: Architecture,
+    pub efi_path: Option<String>,
+    pub label: String,
+    pub bootmgr_path: String,
+    pub bcd_path: String,
+    pub boot_sdi_path: String,
+    pub boot_wim_path: String,
+    pub install_wim_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum BootProfile {
+    Linux(LinuxProfile),
+    Windows(WindowsProfile),
+}
+
+impl BootProfile {
+    pub fn source_kind(&self) -> BootSourceKind {
+        match self {
+            Self::Linux(profile) => profile.source_kind,
+            Self::Windows(profile) => profile.source_kind,
+        }
+    }
+
+    pub fn architecture(&self) -> Architecture {
+        match self {
+            Self::Linux(profile) => profile.architecture,
+            Self::Windows(profile) => profile.architecture,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Linux(profile) => &profile.label,
+            Self::Windows(profile) => &profile.label,
+        }
+    }
+
+    pub fn efi_path(&self) -> Option<&str> {
+        match self {
+            Self::Linux(profile) => profile.efi_path.as_deref(),
+            Self::Windows(profile) => profile.efi_path.as_deref(),
+        }
+    }
 }
 
 /// Byte range of a file stored inside an ISO image.
@@ -105,16 +138,16 @@ pub struct IsoSlice {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Inspect `source_path` and return a `BootProfile` for the first matched distro.
+/// Inspect `source_path` and return a `BootProfile` for the first matched platform.
 ///
 /// # Errors
 ///
 /// - [`ProfileError::SourceUnreadable`] — file cannot be opened or parsed as a supported source.
-/// - [`ProfileError::UnknownDistro`] — no supported distro was detected.
+/// - [`ProfileError::UnknownDistro`] — no supported platform was detected.
 /// - [`ProfileError::MissingFile`] — a required file is absent from the detected distro layout.
 pub fn detect_profile(source_path: &Path) -> Result<BootProfile, ProfileError> {
     if let Some(profile) = freebsd::detect_profile(source_path) {
-        return Ok(profile);
+        return Ok(BootProfile::Linux(profile));
     }
 
     if is_tar_gz(source_path) {
@@ -154,19 +187,12 @@ pub fn list_files(source_path: &Path, prefix: &str) -> Result<Vec<String>, Profi
         let source = load_tar_gz_source(source_path)?;
         source.list_files(prefix)
     } else {
-        let file = std::fs::File::open(source_path)
-            .map_err(|e| ProfileError::SourceUnreadable(source_path.to_path_buf(), e))?;
-        let iso = ISO9660::new(file).map_err(|e| {
-            ProfileError::SourceUnreadable(
-                source_path.to_path_buf(),
-                io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-            )
-        })?;
-        let source = CdfsIso {
-            iso,
-            path: source_path.to_path_buf(),
-        };
-        source.list_files(prefix)
+        if let Ok(source) = udf::UdfIso::open(source_path) {
+            source.list_files(prefix)
+        } else {
+            let source = load_iso9660_source(source_path)?;
+            source.list_files(prefix)
+        }
     }
 }
 
@@ -176,17 +202,9 @@ pub fn load_all_files(source_path: &Path) -> Result<HashMap<String, Vec<u8>>, Pr
         let source = load_tar_gz_source(source_path)?;
         Ok(source.files)
     } else {
-        let file = std::fs::File::open(source_path)
-            .map_err(|e| ProfileError::SourceUnreadable(source_path.to_path_buf(), e))?;
-        let iso = ISO9660::new(file).map_err(|e| {
-            ProfileError::SourceUnreadable(
-                source_path.to_path_buf(),
-                io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-            )
-        })?;
-        let source = CdfsIso {
-            iso,
-            path: source_path.to_path_buf(),
+        let source: Box<dyn SourceFs> = match udf::UdfIso::open(source_path) {
+            Ok(source) => Box::new(source),
+            Err(_) => Box::new(load_iso9660_source(source_path)?),
         };
 
         let mut out = HashMap::new();
@@ -403,25 +421,18 @@ impl SourceFs for MemorySourceFs {
 // ---------------------------------------------------------------------------
 
 fn detect_from_iso(iso_path: &Path) -> Result<BootProfile, ProfileError> {
-    let volume_label = read_iso_volume_label(iso_path);
-    let file = std::fs::File::open(iso_path)
-        .map_err(|e| ProfileError::SourceUnreadable(iso_path.to_path_buf(), e))?;
-    let iso = ISO9660::new(file).map_err(|e| {
-        ProfileError::SourceUnreadable(
-            iso_path.to_path_buf(),
-            io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-        )
-    })?;
-
     let filename = iso_path.file_name().and_then(|n| n.to_str());
-    detect_from_source(
-        &CdfsIso {
-            iso,
-            path: iso_path.to_path_buf(),
-        },
-        filename,
-        volume_label.as_deref(),
-    )
+    if let Ok(udf) = udf::UdfIso::open(iso_path) {
+        match detect_from_source(&udf, filename, udf.volume_label()) {
+            Ok(profile) => return Ok(profile),
+            Err(ProfileError::UnknownDistro) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    let volume_label = read_iso_volume_label(iso_path);
+    let source = load_iso9660_source(iso_path)?;
+    detect_from_source(&source, filename, volume_label.as_deref())
 }
 
 fn read_iso_volume_label(path: &Path) -> Option<String> {
@@ -443,20 +454,13 @@ fn read_iso_volume_label(path: &Path) -> Option<String> {
 }
 
 fn load_file_from_iso(iso_path: &Path, file_path: &str) -> Result<Vec<u8>, ProfileError> {
-    let file = std::fs::File::open(iso_path)
-        .map_err(|e| ProfileError::SourceUnreadable(iso_path.to_path_buf(), e))?;
-    let iso = ISO9660::new(file).map_err(|e| {
-        ProfileError::SourceUnreadable(
-            iso_path.to_path_buf(),
-            io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-        )
-    })?;
+    if let Ok(source) = udf::UdfIso::open(iso_path) {
+        if let Some(content) = source.read_file(file_path)? {
+            return Ok(content);
+        }
+    }
 
-    let source = CdfsIso {
-        iso,
-        path: iso_path.to_path_buf(),
-    };
-    source
+    load_iso9660_source(iso_path)?
         .read_file(file_path)?
         .ok_or_else(|| ProfileError::MissingFile {
             path: file_path.to_string(),
@@ -464,6 +468,14 @@ fn load_file_from_iso(iso_path: &Path, file_path: &str) -> Result<Vec<u8>, Profi
 }
 
 fn load_file_slice_from_iso(source_path: &Path, file_path: &str) -> Result<IsoSlice, ProfileError> {
+    load_iso9660_source(source_path)?
+        .file_slice(file_path)?
+        .ok_or_else(|| ProfileError::MissingFile {
+            path: file_path.to_string(),
+        })
+}
+
+fn load_iso9660_source(source_path: &Path) -> Result<CdfsIso<std::fs::File>, ProfileError> {
     let file = std::fs::File::open(source_path)
         .map_err(|e| ProfileError::SourceUnreadable(source_path.to_path_buf(), e))?;
     let iso = ISO9660::new(file).map_err(|e| {
@@ -472,16 +484,11 @@ fn load_file_slice_from_iso(source_path: &Path, file_path: &str) -> Result<IsoSl
             io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
         )
     })?;
-    let source = CdfsIso {
+
+    Ok(CdfsIso {
         iso,
         path: source_path.to_path_buf(),
-    };
-
-    source
-        .file_slice(file_path)?
-        .ok_or_else(|| ProfileError::MissingFile {
-            path: file_path.to_string(),
-        })
+    })
 }
 
 fn detect_from_tar_gz(source_path: &Path) -> Result<BootProfile, ProfileError> {
@@ -551,64 +558,11 @@ fn detect_from_source(
     volume_label: Option<&str>,
 ) -> Result<BootProfile, ProfileError> {
     if let Some(profile) = freebsd::detect_from_source(source, filename)? {
-        return Ok(profile);
+        return Ok(BootProfile::Linux(profile));
     }
 
-    // Windows: sources/install.wim or sources/install.esd present
-    let install_wim = if source.path_exists("/sources/install.wim")? {
-        Some("/sources/install.wim".to_string())
-    } else if source.path_exists("/sources/install.esd")? {
-        Some("/sources/install.esd".to_string())
-    } else {
-        None
-    };
-
-    if let Some(install_wim_path) = install_wim {
-        for required in [
-            "/bootmgr",
-            "/boot/bcd",
-            "/boot/boot.sdi",
-            "/sources/boot.wim",
-        ] {
-            if !source.path_exists(required)? {
-                return Err(ProfileError::MissingFile {
-                    path: required.to_string(),
-                });
-            }
-        }
-
-        let efi_path = select_first_existing_path(
-            source,
-            &["/efi/boot/bootx64.efi", "/efi/boot/bootaa64.efi"],
-        )?;
-
-        let architecture = if source.path_exists("/efi/boot/bootx64.efi")? {
-            Architecture::Amd64
-        } else if source.path_exists("/efi/boot/bootaa64.efi")? {
-            Architecture::Arm64
-        } else {
-            Architecture::Amd64
-        };
-
-        let label = volume_label
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "Windows (detected)".to_string());
-
-        return Ok(BootProfile {
-            distro: Distro::Windows,
-            source_kind: BootSourceKind::WindowsIso,
-            architecture,
-            source: BootSource::Windows {
-                bootmgr_path: "/bootmgr".to_string(),
-                bcd_path: "/boot/bcd".to_string(),
-                boot_sdi_path: "/boot/boot.sdi".to_string(),
-                boot_wim_path: "/sources/boot.wim".to_string(),
-                install_wim_path,
-            },
-            efi_path,
-            label,
-        });
+    if let Some(profile) = windows::detect_from_source(source, volume_label)? {
+        return Ok(BootProfile::Windows(profile));
     }
 
     // Ubuntu: /.disk/info contains "Ubuntu"
@@ -645,18 +599,16 @@ fn detect_from_source(
                 ],
             )?;
 
-            return Ok(BootProfile {
-                distro: Distro::Ubuntu,
+            return Ok(BootProfile::Linux(LinuxProfile {
+                platform: Platform::Ubuntu,
                 source_kind: BootSourceKind::UbuntuLiveIso,
                 architecture: detect_architecture(source, &[&label], &efi_path, &["/casper"])?,
-                source: BootSource::Linux {
-                    kernel_path: "/casper/vmlinuz".to_string(),
-                    initrd_path: "/casper/initrd".to_string(),
-                    boot_params: String::new(),
-                },
                 efi_path,
                 label,
-            });
+                kernel_path: "/casper/vmlinuz".to_string(),
+                initrd_path: "/casper/initrd".to_string(),
+                boot_params: String::new(),
+            }));
         }
     }
 
@@ -686,18 +638,16 @@ fn detect_from_source(
             ],
         )?;
 
-        return Ok(BootProfile {
-            distro: Distro::Debian,
+        return Ok(BootProfile::Linux(LinuxProfile {
+            platform: Platform::Debian,
             source_kind: BootSourceKind::DebianInstallerIso,
             architecture: detect_architecture(source, &["Debian"], &efi_path, &["/install.amd"])?,
-            source: BootSource::Linux {
-                kernel_path: "/install.amd/vmlinuz".to_string(),
-                initrd_path: "/install.amd/initrd.gz".to_string(),
-                boot_params: String::new(),
-            },
             efi_path,
             label: "Debian".to_string(),
-        });
+            kernel_path: "/install.amd/vmlinuz".to_string(),
+            initrd_path: "/install.amd/initrd.gz".to_string(),
+            boot_params: String::new(),
+        }));
     }
 
     for arch in ["amd64", "arm64"] {
@@ -727,22 +677,20 @@ fn detect_from_source(
                 ],
             )?;
 
-            return Ok(BootProfile {
-                distro: Distro::Debian,
+            return Ok(BootProfile::Linux(LinuxProfile {
+                platform: Platform::Debian,
                 source_kind: BootSourceKind::DebianNetboot,
                 architecture: match arch {
                     "amd64" => Architecture::Amd64,
                     "arm64" => Architecture::Arm64,
                     _ => return Err(ProfileError::UnknownDistro),
                 },
-                source: BootSource::Linux {
-                    kernel_path,
-                    initrd_path,
-                    boot_params: String::new(),
-                },
                 efi_path,
                 label: format!("Debian Netboot ({arch})"),
-            });
+                kernel_path,
+                initrd_path,
+                boot_params: String::new(),
+            }));
         }
     }
 
@@ -864,19 +812,12 @@ mod tests {
 
     // --- Ubuntu detection ---
 
-    fn linux_source(profile: &BootProfile) -> (&str, &str, &str) {
-        match &profile.source {
-            BootSource::Linux {
-                kernel_path,
-                initrd_path,
-                boot_params,
-            } => (
-                kernel_path.as_str(),
-                initrd_path.as_str(),
-                boot_params.as_str(),
-            ),
-            _ => panic!("expected BootSource::Linux"),
-        }
+    fn linux_source(profile: &LinuxProfile) -> (&str, &str, &str) {
+        (
+            profile.kernel_path.as_str(),
+            profile.initrd_path.as_str(),
+            profile.boot_params.as_str(),
+        )
     }
 
     #[test]
@@ -891,10 +832,13 @@ mod tests {
             .with_file("/EFI/BOOT/BOOTX64.EFI", b"");
 
         let profile = detect_from_source(&iso, None, None).unwrap();
-        assert_eq!(profile.distro, Distro::Ubuntu);
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
+        assert_eq!(profile.platform, Platform::Ubuntu);
         assert_eq!(profile.source_kind, BootSourceKind::UbuntuLiveIso);
         assert_eq!(profile.architecture, Architecture::Amd64);
-        let (kp, ip, _) = linux_source(&profile);
+        let (kp, ip, _) = linux_source(profile);
         assert_eq!(kp, "/casper/vmlinuz");
         assert_eq!(ip, "/casper/initrd");
         assert_eq!(profile.efi_path, Some("/EFI/BOOT/BOOTX64.EFI".to_string()));
@@ -912,7 +856,10 @@ mod tests {
             .with_file("/casper/initrd", b"");
 
         let profile = detect_from_source(&iso, None, None).unwrap();
-        let (_, _, bp) = linux_source(&profile);
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
+        let (_, _, bp) = linux_source(profile);
         assert!(bp.is_empty());
         assert_eq!(profile.architecture, Architecture::Unknown);
     }
@@ -956,10 +903,13 @@ mod tests {
             .with_file("/EFI/BOOT/BOOTX64.EFI", b"");
 
         let profile = detect_from_source(&iso, None, None).unwrap();
-        assert_eq!(profile.distro, Distro::Debian);
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
+        assert_eq!(profile.platform, Platform::Debian);
         assert_eq!(profile.source_kind, BootSourceKind::DebianInstallerIso);
         assert_eq!(profile.architecture, Architecture::Amd64);
-        let (kp, ip, _) = linux_source(&profile);
+        let (kp, ip, _) = linux_source(profile);
         assert_eq!(kp, "/install.amd/vmlinuz");
         assert_eq!(ip, "/install.amd/initrd.gz");
         assert_eq!(profile.efi_path, Some("/EFI/BOOT/BOOTX64.EFI".to_string()));
@@ -991,10 +941,13 @@ mod tests {
             .with_file("/debian-installer/arm64/grubaa64.efi", b"");
 
         let profile = detect_from_source(&source, None, None).unwrap();
-        assert_eq!(profile.distro, Distro::Debian);
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
+        assert_eq!(profile.platform, Platform::Debian);
         assert_eq!(profile.source_kind, BootSourceKind::DebianNetboot);
         assert_eq!(profile.architecture, Architecture::Arm64);
-        let (kp, ip, bp) = linux_source(&profile);
+        let (kp, ip, bp) = linux_source(profile);
         assert_eq!(kp, "/debian-installer/arm64/linux");
         assert_eq!(ip, "/debian-installer/arm64/initrd.gz");
         assert_eq!(
@@ -1025,7 +978,10 @@ mod tests {
             .with_dir("/debian");
 
         let profile = detect_from_source(&iso, None, None).unwrap();
-        assert_eq!(profile.distro, Distro::Ubuntu);
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
+        assert_eq!(profile.platform, Platform::Ubuntu);
         assert_eq!(profile.architecture, Architecture::Unknown);
     }
 
@@ -1037,6 +993,9 @@ mod tests {
             .with_file("/casper/initrd", b"");
 
         let profile = detect_from_source(&iso, None, None).unwrap();
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
         assert_eq!(profile.architecture, Architecture::Arm64);
     }
 
@@ -1049,6 +1008,9 @@ mod tests {
             .with_file("/EFI/BOOT/BOOTAA64.EFI", b"");
 
         let profile = detect_from_source(&iso, None, None).unwrap();
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
         assert_eq!(profile.architecture, Architecture::Arm64);
     }
 
@@ -1078,9 +1040,12 @@ mod tests {
             .with_file("/boot/loader.efi", b"");
 
         let profile = detect_from_source(&iso, None, None).unwrap();
-        assert_eq!(profile.distro, Distro::FreeBSD);
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
+        assert_eq!(profile.platform, Platform::FreeBSD);
         assert_eq!(profile.source_kind, BootSourceKind::FreeBSDBootOnly);
-        let (kp, _, _) = linux_source(&profile);
+        let (kp, _, _) = linux_source(profile);
         assert_eq!(kp, "/boot/loader.efi");
         assert_eq!(profile.efi_path, Some("/boot/loader.efi".to_string()));
         assert_eq!(profile.label, "FreeBSD");
@@ -1090,8 +1055,11 @@ mod tests {
     fn freebsd_profile_detected_from_mini_img_filename() {
         let profile = detect_profile(Path::new("FreeBSD-15.0-RELEASE-arm64-aarch64-mini.img"))
             .expect("freebsd mini img profile");
+        let BootProfile::Linux(profile) = &profile else {
+            panic!("expected BootProfile::Linux");
+        };
 
-        assert_eq!(profile.distro, Distro::FreeBSD);
+        assert_eq!(profile.platform, Platform::FreeBSD);
         assert_eq!(profile.source_kind, BootSourceKind::FreeBSDBootOnly);
         assert_eq!(profile.architecture, Architecture::Arm64);
         assert_eq!(profile.efi_path, Some("/boot/loader.efi".to_string()));
@@ -1110,23 +1078,15 @@ mod tests {
             .with_file("/efi/boot/bootx64.efi", b"");
 
         let profile = detect_from_source(&source, None, Some("CCCOMA_X64FRE_EN-US_DV9")).unwrap();
-        assert_eq!(profile.distro, Distro::Windows);
+        let BootProfile::Windows(profile) = &profile else {
+            panic!("expected BootProfile::Windows");
+        };
         assert_eq!(profile.source_kind, BootSourceKind::WindowsIso);
         assert_eq!(profile.architecture, Architecture::Amd64);
         assert_eq!(profile.label, "CCCOMA_X64FRE_EN-US_DV9");
-        match &profile.source {
-            BootSource::Windows {
-                install_wim_path,
-                boot_wim_path,
-                bcd_path,
-                ..
-            } => {
-                assert_eq!(install_wim_path, "/sources/install.wim");
-                assert_eq!(boot_wim_path, "/sources/boot.wim");
-                assert_eq!(bcd_path, "/boot/bcd");
-            }
-            _ => panic!("expected BootSource::Windows"),
-        }
+        assert_eq!(profile.install_wim_path, "/sources/install.wim");
+        assert_eq!(profile.boot_wim_path, "/sources/boot.wim");
+        assert_eq!(profile.bcd_path, "/boot/bcd");
     }
 
     #[test]
@@ -1139,15 +1099,10 @@ mod tests {
             .with_file("/boot/bcd", b"");
 
         let profile = detect_from_source(&source, None, None).unwrap();
-        assert_eq!(profile.distro, Distro::Windows);
-        match &profile.source {
-            BootSource::Windows {
-                install_wim_path, ..
-            } => {
-                assert_eq!(install_wim_path, "/sources/install.esd");
-            }
-            _ => panic!("expected BootSource::Windows"),
-        }
+        let BootProfile::Windows(profile) = &profile else {
+            panic!("expected BootProfile::Windows");
+        };
+        assert_eq!(profile.install_wim_path, "/sources/install.esd");
     }
 
     #[test]
@@ -1160,6 +1115,9 @@ mod tests {
             .with_file("/boot/bcd", b"");
 
         let profile = detect_from_source(&source, None, None).unwrap();
+        let BootProfile::Windows(profile) = &profile else {
+            panic!("expected BootProfile::Windows");
+        };
         assert_eq!(profile.label, "Windows (detected)");
     }
 
@@ -1205,7 +1163,29 @@ mod tests {
             .with_file("/boot/bcd", b"");
 
         let profile = detect_from_source(&source, None, None).unwrap();
+        let BootProfile::Windows(profile) = &profile else {
+            panic!("expected BootProfile::Windows");
+        };
         assert_eq!(profile.architecture, Architecture::Amd64);
+    }
+
+    #[test]
+    fn windows_arm64_detected_from_uefi_layout() {
+        let source = MockSource::new()
+            .with_file("/bootmgr.efi", b"")
+            .with_file("/boot/boot.sdi", b"")
+            .with_file("/sources/install.wim", b"")
+            .with_file("/sources/boot.wim", b"")
+            .with_file("/efi/microsoft/boot/bcd", b"")
+            .with_file("/efi/boot/bootaa64.efi", b"");
+
+        let profile = detect_from_source(&source, None, Some("CCCOMA_A64FRE_EN-US_DV9")).unwrap();
+        let BootProfile::Windows(profile) = &profile else {
+            panic!("expected BootProfile::Windows");
+        };
+        assert_eq!(profile.architecture, Architecture::Arm64);
+        assert_eq!(profile.bootmgr_path, "/bootmgr.efi");
+        assert_eq!(profile.bcd_path, "/efi/microsoft/boot/bcd");
     }
 
     #[test]
