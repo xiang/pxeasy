@@ -15,10 +15,10 @@ const FIXED_HEADER_LEN: usize = 236;
 pub const MIN_PACKET_LEN: usize = FIXED_HEADER_LEN + 4;
 
 // ── Op ────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Op {
+    #[default]
     BootRequest = 1,
     BootReply = 2,
 }
@@ -43,6 +43,28 @@ pub struct DhcpPacket {
     pub sname: [u8; 64],
     pub file: [u8; 128],
     pub options: Vec<DhcpOption>,
+}
+
+impl Default for DhcpPacket {
+    fn default() -> Self {
+        Self {
+            op: Op::default(),
+            htype: 1, // Ethernet
+            hlen: 6,  // MAC
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: Ipv4Addr::UNSPECIFIED,
+            yiaddr: Ipv4Addr::UNSPECIFIED,
+            siaddr: Ipv4Addr::UNSPECIFIED,
+            giaddr: Ipv4Addr::UNSPECIFIED,
+            chaddr: [0u8; 16],
+            sname: [0u8; 64],
+            file: [0u8; 128],
+            options: Vec::new(),
+        }
+    }
 }
 
 impl DhcpPacket {
@@ -119,8 +141,8 @@ impl DhcpPacket {
     }
 
     /// Return the first option with the given tag, if present.
-    pub fn get_option(&self, tag: u8) -> Option<&DhcpOption> {
-        self.options.iter().find(|o| o.tag() == tag)
+    pub fn option(&self, tag: u8) -> Option<&DhcpOption> {
+        self.options.iter().find(|o: &&DhcpOption| o.tag() == tag)
     }
 
     /// Return the DHCP message type from option 53, if present.
@@ -134,11 +156,33 @@ impl DhcpPacket {
         })
     }
 
-    /// Returns `true` if option 60 starts with `PXEClient`.
+    /// Returns `true` if option 60 starts with `PXEClient` or `HTTPClient`.
     pub fn is_pxe_client(&self) -> bool {
         self.options.iter().any(|o| {
             if let DhcpOption::VendorClassIdentifier(v) = o {
-                v.starts_with(b"PXEClient")
+                v.starts_with(b"PXEClient") || v.starts_with(b"HTTPClient")
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Returns `true` if option 60 starts with `HTTPClient`.
+    pub fn is_http_client(&self) -> bool {
+        self.options.iter().any(|o| {
+            if let DhcpOption::VendorClassIdentifier(v) = o {
+                v.starts_with(b"HTTPClient")
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Returns `true` if the client is iPXE, identified natively via Option 77 (User Class).
+    pub fn is_ipxe_client(&self) -> bool {
+        self.options.iter().any(|o| {
+            if let DhcpOption::Unknown(77, v) = o {
+                v.starts_with(b"iPXE")
             } else {
                 false
             }
@@ -280,13 +324,13 @@ mod tests {
     }
 
     #[test]
-    fn get_option() {
+    fn option_accessor() {
         let mut buf = minimal_packet(2);
         buf.pop();
         buf.extend_from_slice(&[54, 4, 192, 168, 1, 1, 255]); // ServerIdentifier
         let pkt = DhcpPacket::parse(&buf).unwrap();
-        assert!(pkt.get_option(54).is_some());
-        assert!(pkt.get_option(53).is_none());
+        assert!(pkt.option(54).is_some());
+        assert!(pkt.option(53).is_none());
     }
 
     #[test]
