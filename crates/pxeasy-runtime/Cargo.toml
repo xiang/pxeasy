@@ -1,0 +1,16 @@
+[package]
+name = "pxeasy-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1"
+if-addrs = "0.13"
+log = "0.4"
+pxe-dhcp = { path = "../pxe-dhcp" }
+pxe-http = { path = "../pxe-http" }
+pxe-nfs = { path = "../pxe-nfs" }
+pxe-profiles = { path = "../pxe-profiles" }
+pxe-smb = { path = "../pxe-smb" }
+pxe-tftp = { path = "../pxe-tftp" }
+tempfile = "3"
