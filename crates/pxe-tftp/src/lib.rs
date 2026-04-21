@@ -89,7 +89,7 @@ impl TftpServer {
         let mut buf = [0u8; 65_535];
         let (len, peer) = self.socket.recv_from(&mut buf)?;
         if let Err(err) = self.handle_packet(peer, &buf[..len]) {
-            eprintln!("tftp: failed to handle packet from {}: {}", peer, err);
+            log::warn!("tftp: failed to handle packet from {}: {}", peer, err);
         }
         Ok(())
     }
@@ -98,7 +98,7 @@ impl TftpServer {
         let request = match RequestPacket::parse(packet) {
             Ok(Some(request)) => request,
             Ok(None) => {
-                eprintln!("tftp: dropping malformed packet from {}", peer);
+                log::warn!("tftp: dropping malformed packet from {}", peer);
                 return Ok(());
             }
             Err(response) => {
@@ -124,6 +124,7 @@ impl TftpServer {
     }
 
     fn handle_rrq(&self, peer: SocketAddr, request: RequestPacket) -> io::Result<()> {
+        log::debug!("tftp: rrq from {} for {}", peer, request.filename);
         let path = match validate_path(&request.filename) {
             Ok(path) => path,
             Err((code, message)) => {
@@ -133,10 +134,14 @@ impl TftpServer {
             }
         };
 
-        let file = match self.file_map.get(&path) {
+        let file = match self
+            .file_map
+            .get(&path)
+            .or_else(|| self.file_map.get(&path.to_ascii_lowercase()))
+        {
             Some(file) => file.clone(),
             None => {
-                eprintln!("tftp: requested unknown file {}", path);
+                log::warn!("tftp: requested unknown file {}", path);
                 let response = encode_error(ERROR_FILE_NOT_FOUND, "file not found");
                 self.socket.send_to(&response, peer)?;
                 return Ok(());
@@ -156,7 +161,7 @@ impl TftpServer {
         socket.set_read_timeout(Some(Duration::from_secs(u64::from(transfer.timeout_secs))))?;
         thread::spawn(move || {
             if let Err(err) = run_transfer(socket, peer, file, transfer) {
-                eprintln!("tftp: transfer to {} failed: {}", peer, err);
+                log::warn!("tftp: transfer to {} failed: {}", peer, err);
             }
         });
         Ok(())
@@ -289,6 +294,36 @@ fn negotiate_transfer(
     })
 }
 
+fn validate_path(path: &str) -> Result<String, (u16, &'static str)> {
+    if path.is_empty() || path.contains("..") {
+        return Err((ERROR_ACCESS_VIOLATION, "invalid path"));
+    }
+
+    let normalized = path.replace('\\', "/");
+    let trimmed = normalized.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err((ERROR_ACCESS_VIOLATION, "invalid path"));
+    }
+
+    let mut parts = Vec::new();
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            continue;
+        }
+        parts.push(component);
+    }
+
+    if parts.is_empty() {
+        return Err((ERROR_ACCESS_VIOLATION, "invalid path"));
+    }
+
+    Ok(parts.join("/"))
+}
+
+const MAX_RETRIES: usize = 32;
+const SEND_RETRIES: usize = 5_000;
+const SEND_RETRY_DELAY: Duration = Duration::from_millis(1);
+
 fn run_transfer(
     socket: UdpSocket,
     peer: SocketAddr,
@@ -297,8 +332,23 @@ fn run_transfer(
 ) -> io::Result<()> {
     if !options.response_options.is_empty() {
         let packet = encode_oack(&options.response_options);
-        socket.send_to(&packet, peer)?;
-        wait_for_ack(&socket, peer, 0)?;
+        let mut retries = 0;
+        loop {
+            send_packet(&socket, peer, &packet)?;
+            match wait_for_ack(&socket, peer, 0) {
+                Ok(()) => break,
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    retries += 1;
+                    if retries >= MAX_RETRIES {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     let mut offset = 0usize;
@@ -306,15 +356,29 @@ fn run_transfer(
     loop {
         let chunk_len = usize::from(options.block_size).min(file.len().saturating_sub(offset));
         let chunk = &file[offset..offset + chunk_len];
-        send_data_block(&socket, peer, block, chunk)?;
 
-        wait_for_ack(&socket, peer, block)?;
+        let mut retries = 0;
+        loop {
+            send_data_block(&socket, peer, block, chunk)?;
+            match wait_for_ack(&socket, peer, block) {
+                Ok(()) => break,
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    retries += 1;
+                    if retries >= MAX_RETRIES {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         offset += chunk_len;
-
         if chunk_len < usize::from(options.block_size) {
             break;
         }
-
         block = block.wrapping_add(1);
     }
 
@@ -344,8 +408,24 @@ fn send_data_block(
     payload: &[u8],
 ) -> io::Result<()> {
     let packet = encode_data(block, payload);
-    socket.send_to(&packet, peer)?;
-    Ok(())
+    send_packet(socket, peer, &packet)
+}
+
+fn send_packet(socket: &UdpSocket, peer: SocketAddr, packet: &[u8]) -> io::Result<()> {
+    let mut retries = 0;
+    loop {
+        match socket.send_to(packet, peer) {
+            Ok(_) => return Ok(()),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                retries += 1;
+                if retries >= SEND_RETRIES {
+                    return Err(io::Error::other("TFTP: send_to blocked too many times"));
+                }
+                thread::sleep(SEND_RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,22 +442,6 @@ impl AckPacket {
         }
         Some(u16::from_be_bytes([packet[2], packet[3]]))
     }
-}
-
-fn validate_path(path: &str) -> Result<String, (u16, &'static str)> {
-    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
-        return Err((ERROR_ACCESS_VIOLATION, "invalid path"));
-    }
-
-    let mut normalized = Vec::new();
-    for component in path.split('/') {
-        if component.is_empty() || component == "." || component == ".." {
-            return Err((ERROR_ACCESS_VIOLATION, "invalid path"));
-        }
-        normalized.push(component);
-    }
-
-    Ok(normalized.join("/"))
 }
 
 fn split_nul_terminated(bytes: &[u8]) -> Option<Vec<&[u8]>> {
@@ -458,14 +522,18 @@ mod tests {
 
     #[test]
     fn request_parser_accepts_octet_mode_and_options() {
-        let packet = rrq("boot.ipxe", "octet", &[("blksize", "1024"), ("tsize", "0")]);
+        let packet = rrq(
+            "bootx64.efi",
+            "octet",
+            &[("blksize", "1024"), ("tsize", "0")],
+        );
 
         let request = RequestPacket::parse(&packet)
             .expect("request should not emit error response")
             .expect("request should parse");
 
         assert_eq!(request.opcode, OPCODE_RRQ);
-        assert_eq!(request.filename, "boot.ipxe");
+        assert_eq!(request.filename, "bootx64.efi");
         assert_eq!(
             request.options,
             vec![
@@ -477,7 +545,7 @@ mod tests {
 
     #[test]
     fn request_parser_rejects_non_octet_mode() {
-        let packet = rrq("boot.ipxe", "netascii", &[]);
+        let packet = rrq("bootx64.efi", "netascii", &[]);
 
         let response = RequestPacket::parse(&packet).expect_err("mode should be rejected");
 
@@ -491,10 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn path_validation_rejects_parent_components() {
-        let result = validate_path("../boot.ipxe");
-
-        assert_eq!(result, Err((ERROR_ACCESS_VIOLATION, "invalid path")));
+    fn path_validation_handles_slashes_and_dots() {
+        assert_eq!(validate_path("/bootx64.efi").unwrap(), "bootx64.efi");
+        assert_eq!(validate_path("boot\\grub.cfg").unwrap(), "boot/grub.cfg");
+        assert!(validate_path("../bootx64.efi").is_err());
     }
 
     #[test]
@@ -551,8 +619,8 @@ mod tests {
     fn server_serves_file_with_oack_and_data() {
         let mut files = HashMap::new();
         files.insert(
-            "boot.ipxe".to_string(),
-            Bytes::from_static(b"chain http://boot\n"),
+            "bootx64.efi".to_string(),
+            Bytes::from_static(b"EFI bootloader"),
         );
 
         let server = TftpServer::bind(TftpConfig {
@@ -571,7 +639,7 @@ mod tests {
         let handle = thread::spawn(move || server.serve_once());
         client
             .send_to(
-                &rrq("boot.ipxe", "octet", &[("blksize", "8"), ("tsize", "0")]),
+                &rrq("bootx64.efi", "octet", &[("blksize", "8"), ("tsize", "0")]),
                 server_addr,
             )
             .expect("request should send");
@@ -584,7 +652,7 @@ mod tests {
             &buf[2..oack_len],
             &[
                 b'b', b'l', b'k', b's', b'i', b'z', b'e', 0, b'8', 0, b't', b's', b'i', b'z', b'e',
-                0, b'1', b'8', 0,
+                0, b'1', b'4', 0,
             ]
         );
 
@@ -614,6 +682,6 @@ mod tests {
 
         let join_result = handle.join().expect("server thread should join");
         assert!(join_result.is_ok());
-        assert_eq!(received, b"chain http://boot\n");
+        assert_eq!(received, b"EFI bootloader");
     }
 }
