@@ -36,6 +36,7 @@ fn proxy_offer(discover: &DhcpPacket, server_ip: [u8; 4]) -> DhcpPacket {
             0x80, 0x00, 0x07, b'i', b'p', b'x', b'e', b'.', b'e', b'f', b'i',
         ]),
         menu_prompt: Some(b"PXE Boot".to_vec()),
+        boot_item: None,
         ..Default::default()
     };
 
@@ -85,9 +86,10 @@ fn offer_round_trip() {
 fn pxe_vendor_options_embedded_in_packet_round_trip() {
     let pxe_opts = PxeVendorOptions {
         discovery_control: Some(0x08),
-        boot_servers: Some(vec![0x00, 0x01, 192, 168, 1, 10]),
+        boot_servers: Some(vec![0x00, 0x01, 1, 192, 168, 1, 10]),
         boot_menu: Some(b"\x80\x00\x08ipxe.efi".to_vec()),
         menu_prompt: Some(b"Network Boot".to_vec()),
+        boot_item: Some(vec![0x00, 0x01, 0x00, 0x01]),
     };
 
     let raw_option43 = pxe_opts.serialize();

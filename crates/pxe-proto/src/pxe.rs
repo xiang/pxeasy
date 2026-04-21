@@ -15,6 +15,8 @@ pub struct PxeVendorOptions {
     pub boot_menu: Option<Vec<u8>>,
     /// Sub-option 10: Menu prompt string (raw).
     pub menu_prompt: Option<Vec<u8>>,
+    /// Sub-option 71: Boot item (raw; 4 bytes: type (2), index (2)).
+    pub boot_item: Option<Vec<u8>>,
 }
 
 impl PxeVendorOptions {
@@ -62,6 +64,7 @@ impl PxeVendorOptions {
                         8 => out.boot_servers = Some(sub.to_vec()),
                         9 => out.boot_menu = Some(sub.to_vec()),
                         10 => out.menu_prompt = Some(sub.to_vec()),
+                        71 => out.boot_item = Some(sub.to_vec()),
                         _ => {} // unknown sub-options are silently skipped
                     }
                 }
@@ -91,7 +94,11 @@ impl PxeVendorOptions {
             out.push(mp.len() as u8);
             out.extend_from_slice(mp);
         }
-        out.push(255); // End
+        if let Some(bi) = &self.boot_item {
+            out.push(71);
+            out.push(bi.len() as u8);
+            out.extend_from_slice(bi);
+        }
         out
     }
 }
@@ -120,6 +127,7 @@ mod tests {
             boot_servers: Some(vec![0x00, 0x01, 0x02]),
             boot_menu: Some(vec![0x80, 0x00, 0x07, b'i', b'p', b'x', b'e']),
             menu_prompt: Some(b"Boot menu".to_vec()),
+            boot_item: Some(vec![0x00, 0x01, 0x00, 0x01]),
         };
         let bytes = opts.serialize();
         let parsed = PxeVendorOptions::parse(&bytes).unwrap();
@@ -128,14 +136,12 @@ mod tests {
 
     #[test]
     fn empty_is_default() {
-        // End-only payload → all fields None
-        let parsed = PxeVendorOptions::parse(&[255]).unwrap();
+        let parsed = PxeVendorOptions::parse(&[]).unwrap();
         assert_eq!(parsed, PxeVendorOptions::default());
     }
 
     #[test]
     fn empty_payload_ok() {
-        // Some DHCP servers send option 43 with no sub-options at all
         let parsed = PxeVendorOptions::parse(&[]).unwrap();
         assert_eq!(parsed, PxeVendorOptions::default());
     }
