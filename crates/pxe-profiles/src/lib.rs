@@ -134,6 +134,17 @@ pub struct IsoSlice {
     pub length: u64,
 }
 
+/// Lightweight metadata for a single entry in a boot source image.
+#[derive(Debug, Clone)]
+pub struct IsoEntryMeta {
+    pub is_dir: bool,
+    pub size: u64,
+    /// Byte offset of the file's data within the ISO image, if known.
+    pub iso_offset: Option<u64>,
+    /// Original-case leaf filename (not the full path).
+    pub display_name: String,
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -181,7 +192,53 @@ pub fn load_file_slice(source_path: &Path, file_path: &str) -> Result<IsoSlice, 
     load_file_slice_from_iso(source_path, file_path)
 }
 
+/// Load a byte range from a file in the detected boot source.
+pub fn load_file_range(
+    source_path: &Path,
+    file_path: &str,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, ProfileError> {
+    if is_tar_gz(source_path) {
+        let bytes = load_file_from_tar_gz(source_path, file_path)?;
+        return slice_loaded_file(file_path, &bytes, offset, length);
+    }
+
+    if let Ok(source) = udf::UdfIso::open(source_path) {
+        return source.read_file_range(file_path, offset, length);
+    }
+
+    let slice = load_file_slice_from_iso(source_path, file_path)?;
+    if offset > slice.length {
+        return Err(ProfileError::MissingFile {
+            path: file_path.to_string(),
+        });
+    }
+    let available = slice.length - offset;
+    let to_read = length.min(available as usize);
+    let mut file = std::fs::File::open(source_path)
+        .map_err(|err| ProfileError::SourceUnreadable(source_path.to_path_buf(), err))?;
+    file.seek(SeekFrom::Start(slice.offset + offset))
+        .map_err(|err| ProfileError::SourceUnreadable(source_path.to_path_buf(), err))?;
+    let mut bytes = vec![0u8; to_read];
+    file.read_exact(&mut bytes)
+        .map_err(|err| ProfileError::SourceUnreadable(source_path.to_path_buf(), err))?;
+    Ok(bytes)
+}
+
 /// List all files in the detected boot source that start with `prefix`.
+pub fn list_dir(source_path: &Path, dir_path: &str) -> Result<Vec<(String, bool)>, ProfileError> {
+    if is_tar_gz(source_path) {
+        let source = load_tar_gz_source(source_path)?;
+        source.list_dir(dir_path)
+    } else if let Ok(source) = udf::UdfIso::open(source_path) {
+        source.list_dir(dir_path)
+    } else {
+        let source = load_iso9660_source(source_path)?;
+        source.list_dir(dir_path)
+    }
+}
+
 pub fn list_files(source_path: &Path, prefix: &str) -> Result<Vec<String>, ProfileError> {
     if is_tar_gz(source_path) {
         let source = load_tar_gz_source(source_path)?;
@@ -194,6 +251,62 @@ pub fn list_files(source_path: &Path, prefix: &str) -> Result<Vec<String>, Profi
             source.list_files(prefix)
         }
     }
+}
+
+/// Walk the entire source image once and return a map of lowercase-normalized
+/// path → [`IsoEntryMeta`] for every file and directory.
+///
+/// Callers that need to serve many files from the same image should build this
+/// map at startup and use it for O(1) lookups instead of re-opening the image
+/// on every request.
+pub fn build_metadata_map(
+    source_path: &Path,
+) -> Result<HashMap<String, IsoEntryMeta>, ProfileError> {
+    let mut map = HashMap::new();
+    map.insert(
+        "/".to_string(),
+        IsoEntryMeta {
+            is_dir: true,
+            size: 0,
+            iso_offset: None,
+            display_name: String::new(),
+        },
+    );
+
+    if let Ok(source) = udf::UdfIso::open(source_path) {
+        for (path, is_dir, size, iso_offset) in source.walk_all_entries()? {
+            let normalized = normalize_path(&path);
+            let display_name = normalized.rsplit('/').next().unwrap_or("").to_string();
+            map.insert(
+                normalized.to_ascii_lowercase(),
+                IsoEntryMeta {
+                    is_dir,
+                    size,
+                    iso_offset,
+                    display_name,
+                },
+            );
+        }
+    } else if !is_tar_gz(source_path) {
+        let source = load_iso9660_source(source_path)?;
+        let mut raw = Vec::new();
+        source.walk_dir_all("/", &mut raw)?;
+        for (path, is_dir, size, iso_offset) in raw {
+            let normalized = normalize_path(&path);
+            let display_name = normalized.rsplit('/').next().unwrap_or("").to_string();
+            map.insert(
+                normalized.to_ascii_lowercase(),
+                IsoEntryMeta {
+                    is_dir,
+                    size,
+                    iso_offset,
+                    display_name,
+                },
+            );
+        }
+    }
+
+    Ok(map)
 }
 
 /// Load all files from the detected boot source into memory.
@@ -236,6 +349,33 @@ pub(crate) trait SourceFs {
     fn path_exists(&self, path: &str) -> Result<bool, ProfileError>;
     /// Return all file paths starting with `prefix`.
     fn list_files(&self, prefix: &str) -> Result<Vec<String>, ProfileError>;
+    /// Return immediate children of `dir_path` as (name, is_dir) pairs.
+    fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, ProfileError> {
+        let prefix = normalize_path(dir_path);
+        let dir_prefix = if prefix == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", prefix)
+        };
+        let files = self.list_files(&dir_prefix)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for file_path in &files {
+            let relative = file_path
+                .strip_prefix(&dir_prefix)
+                .unwrap_or(file_path.as_str());
+            let immediate = relative.split('/').next().unwrap_or("");
+            if immediate.is_empty() {
+                continue;
+            }
+            if seen.insert(immediate.to_string()) {
+                let is_dir = relative.contains('/');
+                result.push((immediate.to_string(), is_dir));
+            }
+        }
+        result.sort();
+        Ok(result)
+    }
 }
 
 struct CdfsIso<R: cdfs::ISO9660Reader> {
@@ -298,6 +438,35 @@ impl<R: cdfs::ISO9660Reader> SourceFs for CdfsIso<R> {
         self.walk_dir("/", &prefix, &mut out)?;
         Ok(out)
     }
+
+    fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, ProfileError> {
+        let entry = self.iso.open(dir_path).map_err(|e| {
+            ProfileError::SourceUnreadable(
+                self.path.clone(),
+                io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+            )
+        })?;
+        let Some(DirectoryEntry::Directory(dir)) = entry else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::new();
+        for entry_result in dir.contents() {
+            let entry = entry_result.map_err(|e| {
+                ProfileError::SourceUnreadable(
+                    self.path.clone(),
+                    io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+                )
+            })?;
+            let name = entry.identifier().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let is_dir = matches!(entry, DirectoryEntry::Directory(_));
+            result.push((name, is_dir));
+        }
+        result.sort();
+        Ok(result)
+    }
 }
 
 impl<R: cdfs::ISO9660Reader> CdfsIso<R> {
@@ -342,6 +511,57 @@ impl<R: cdfs::ISO9660Reader> CdfsIso<R> {
 
                 if let DirectoryEntry::Directory(_) = entry {
                     self.walk_dir(&full_path, prefix, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk every entry in the image and collect (path, is_dir, size, iso_offset).
+    pub(crate) fn walk_dir_all(
+        &self,
+        path: &str,
+        out: &mut Vec<(String, bool, u64, Option<u64>)>,
+    ) -> Result<(), ProfileError> {
+        let entry = self.iso.open(path).map_err(|e| {
+            ProfileError::SourceUnreadable(
+                self.path.clone(),
+                io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+            )
+        })?;
+
+        if let Some(DirectoryEntry::Directory(dir)) = entry {
+            for entry_result in dir.contents() {
+                let entry = entry_result.map_err(|e| {
+                    ProfileError::SourceUnreadable(
+                        self.path.clone(),
+                        io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+                    )
+                })?;
+
+                let name = entry.identifier();
+                if name == "." || name == ".." {
+                    continue;
+                }
+
+                let full_path = if path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", path, name)
+                };
+
+                match entry {
+                    DirectoryEntry::File(f) => {
+                        let header = f.header();
+                        let offset = u64::from(header.extent_loc) * u64::from(cdfs::BLOCK_SIZE);
+                        let size = u64::from(header.extent_length);
+                        out.push((full_path, false, size, Some(offset)));
+                    }
+                    DirectoryEntry::Directory(_) => {
+                        out.push((full_path.clone(), true, 0, None));
+                        self.walk_dir_all(&full_path, out)?;
+                    }
+                    DirectoryEntry::Symlink(_) => {}
                 }
             }
         }
@@ -473,6 +693,24 @@ fn load_file_slice_from_iso(source_path: &Path, file_path: &str) -> Result<IsoSl
         .ok_or_else(|| ProfileError::MissingFile {
             path: file_path.to_string(),
         })
+}
+
+fn slice_loaded_file(
+    file_path: &str,
+    bytes: &[u8],
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, ProfileError> {
+    let start = usize::try_from(offset).map_err(|_| ProfileError::MissingFile {
+        path: file_path.to_string(),
+    })?;
+    if start > bytes.len() {
+        return Err(ProfileError::MissingFile {
+            path: file_path.to_string(),
+        });
+    }
+    let end = start.saturating_add(length).min(bytes.len());
+    Ok(bytes[start..end].to_vec())
 }
 
 fn load_iso9660_source(source_path: &Path) -> Result<CdfsIso<std::fs::File>, ProfileError> {

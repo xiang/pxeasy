@@ -60,6 +60,15 @@ struct NodeDescriptor {
     allocation_descriptors_length: usize,
 }
 
+type WalkEntry = (String, bool, u64, Option<u64>);
+
+struct RangeReadState {
+    offset: u64,
+    wanted: usize,
+    logical_pos: u64,
+    out: Vec<u8>,
+}
+
 pub(crate) struct UdfIso {
     file: Mutex<File>,
     path: PathBuf,
@@ -89,6 +98,32 @@ impl UdfIso {
 
     pub(crate) fn volume_label(&self) -> Option<&str> {
         self.volume_label.as_deref()
+    }
+
+    pub(crate) fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, ProfileError> {
+        let Some(entry) = self.resolve_path(path)? else {
+            return Err(ProfileError::MissingFile {
+                path: path.to_string(),
+            });
+        };
+        if entry.is_directory {
+            return Err(ProfileError::MissingFile {
+                path: path.to_string(),
+            });
+        }
+
+        let descriptor = self.read_node_descriptor(entry.icb)?;
+        if descriptor.file_type != FILE_TYPE_REGULAR {
+            return Err(ProfileError::MissingFile {
+                path: path.to_string(),
+            });
+        }
+        self.read_node_data_range(entry.icb, descriptor, offset, length)
     }
 
     fn resolve_path(&self, path: &str) -> Result<Option<DirEntry>, ProfileError> {
@@ -145,6 +180,52 @@ impl UdfIso {
         }
 
         Ok(())
+    }
+
+    /// Walk every entry (files and directories) and return (path, is_dir, size).
+    pub(crate) fn walk_all_entries(&self) -> Result<Vec<WalkEntry>, ProfileError> {
+        let mut out = Vec::new();
+        self.walk_all_recursive(self.root_icb, "/", &mut out)?;
+        Ok(out)
+    }
+
+    fn walk_all_recursive(
+        &self,
+        dir_icb: LongAllocationDescriptor,
+        dir_path: &str,
+        out: &mut Vec<WalkEntry>,
+    ) -> Result<(), ProfileError> {
+        for entry in self.read_directory_entries(dir_icb, dir_path)? {
+            if entry.is_directory {
+                out.push((entry.path.clone(), true, 0, None));
+                self.walk_all_recursive(entry.icb, &entry.path, out)?;
+            } else {
+                let (size, iso_offset) = self.read_node_size_and_offset(entry.icb)?;
+                out.push((entry.path, false, size, iso_offset));
+            }
+        }
+        Ok(())
+    }
+
+    // Reads the file entry block once and returns both the file size and the
+    // byte offset of the first extent. Assumes contiguous layout, which holds
+    // for all mastered ISO images.
+    fn read_node_size_and_offset(
+        &self,
+        icb: LongAllocationDescriptor,
+    ) -> Result<(u64, Option<u64>), ProfileError> {
+        let mut file = self.file.lock().map_err(lock_error)?;
+        let offset = self.block_offset(icb.logical_block_num);
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|err| source_error(self.path.clone(), err))?;
+        let mut block = vec![0u8; self.block_size as usize];
+        file.read_exact(&mut block)
+            .map_err(|err| source_error(self.path.clone(), err))?;
+        let descriptor =
+            parse_node_descriptor(&block).map_err(|err| source_error(self.path.clone(), err))?;
+        let iso_offset =
+            first_extent_byte_offset(&block, &descriptor, self.partition_start, self.block_size);
+        Ok((descriptor.information_length, iso_offset))
     }
 
     fn read_directory_entries(
@@ -232,6 +313,68 @@ impl UdfIso {
         }
     }
 
+    fn read_node_data_range(
+        &self,
+        icb: LongAllocationDescriptor,
+        descriptor: NodeDescriptor,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, ProfileError> {
+        if offset > descriptor.information_length {
+            return Err(source_error(
+                self.path.clone(),
+                io::Error::new(io::ErrorKind::UnexpectedEof, "UDF range starts past EOF"),
+            ));
+        }
+        let available = descriptor.information_length - offset;
+        let wanted = length.min(available as usize);
+        if wanted == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut file = self.file.lock().map_err(lock_error)?;
+        let node_offset = self.block_offset(icb.logical_block_num);
+        file.seek(SeekFrom::Start(node_offset))
+            .map_err(|err| source_error(self.path.clone(), err))?;
+
+        let mut block = vec![0u8; self.block_size as usize];
+        file.read_exact(&mut block)
+            .map_err(|err| source_error(self.path.clone(), err))?;
+
+        let data = block
+            .get(
+                descriptor.allocation_descriptors_offset
+                    ..descriptor.allocation_descriptors_offset
+                        + descriptor.allocation_descriptors_length,
+            )
+            .ok_or_else(|| {
+                source_error(
+                    self.path.clone(),
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UDF allocation descriptors exceed node size",
+                    ),
+                )
+            })?;
+
+        match descriptor.allocation_type {
+            ALLOCATION_EMBEDDED => {
+                let start = offset as usize;
+                let end = start.saturating_add(wanted).min(data.len());
+                Ok(data[start..end].to_vec())
+            }
+            ALLOCATION_SHORT => self.read_short_extents_range(&mut file, data, offset, wanted),
+            ALLOCATION_LONG => self.read_long_extents_range(&mut file, data, offset, wanted),
+            other => Err(source_error(
+                self.path.clone(),
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported UDF allocation type: {other}"),
+                ),
+            )),
+        }
+    }
+
     fn read_short_extents(
         &self,
         file: &mut File,
@@ -293,6 +436,110 @@ impl UdfIso {
         Ok(out)
     }
 
+    fn read_short_extents_range(
+        &self,
+        file: &mut File,
+        descriptors: &[u8],
+        offset: u64,
+        wanted: usize,
+    ) -> Result<Vec<u8>, ProfileError> {
+        let mut state = RangeReadState {
+            offset,
+            wanted,
+            logical_pos: 0,
+            out: Vec::with_capacity(wanted),
+        };
+        for chunk in descriptors.chunks_exact(8) {
+            let extent_length =
+                le_u32(chunk, 0).map_err(|err| source_error(self.path.clone(), err))?;
+            if extent_length == 0 {
+                break;
+            }
+
+            let length = u64::from(extent_length & 0x3FFF_FFFF);
+            let block_num = le_u32(chunk, 4).map_err(|err| source_error(self.path.clone(), err))?;
+            self.read_extent_range(file, block_num, length, &mut state)?;
+            if state.out.len() >= wanted {
+                break;
+            }
+        }
+        Ok(state.out)
+    }
+
+    fn read_long_extents_range(
+        &self,
+        file: &mut File,
+        descriptors: &[u8],
+        offset: u64,
+        wanted: usize,
+    ) -> Result<Vec<u8>, ProfileError> {
+        let mut state = RangeReadState {
+            offset,
+            wanted,
+            logical_pos: 0,
+            out: Vec::with_capacity(wanted),
+        };
+        for chunk in descriptors.chunks_exact(16) {
+            let ad = parse_long_ad(chunk).map_err(|err| source_error(self.path.clone(), err))?;
+            let length = ad.length() as u64;
+            if length == 0 {
+                break;
+            }
+            if ad.partition_ref_num != 0 {
+                return Err(source_error(
+                    self.path.clone(),
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unsupported UDF partition reference: {}",
+                            ad.partition_ref_num
+                        ),
+                    ),
+                ));
+            }
+
+            self.read_extent_range(file, ad.logical_block_num, length, &mut state)?;
+            if state.out.len() >= wanted {
+                break;
+            }
+        }
+        Ok(state.out)
+    }
+
+    fn read_extent_range(
+        &self,
+        file: &mut File,
+        block_num: u32,
+        extent_length: u64,
+        state: &mut RangeReadState,
+    ) -> Result<(), ProfileError> {
+        let extent_start = state.logical_pos;
+        let extent_end = extent_start.saturating_add(extent_length);
+        state.logical_pos = extent_end;
+
+        if extent_end <= state.offset || state.out.len() >= state.wanted {
+            return Ok(());
+        }
+
+        let in_extent_start = state.offset.saturating_sub(extent_start);
+        let remaining = state.wanted - state.out.len();
+        let available = extent_length.saturating_sub(in_extent_start);
+        let to_read = remaining.min(available as usize);
+        if to_read == 0 {
+            return Ok(());
+        }
+
+        let read_offset = self.block_offset(block_num).saturating_add(in_extent_start);
+        file.seek(SeekFrom::Start(read_offset))
+            .map_err(|err| source_error(self.path.clone(), err))?;
+
+        let start_len = state.out.len();
+        state.out.resize(start_len + to_read, 0);
+        file.read_exact(&mut state.out[start_len..])
+            .map_err(|err| source_error(self.path.clone(), err))?;
+        Ok(())
+    }
+
     fn read_extent(
         &self,
         file: &mut File,
@@ -341,6 +588,19 @@ impl SourceFs for UdfIso {
         self.walk_files(self.root_icb, "/", &prefix, &mut out)?;
         out.sort();
         Ok(out)
+    }
+
+    fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, ProfileError> {
+        let Some(entry) = self.resolve_path(dir_path)? else {
+            return Ok(Vec::new());
+        };
+        let entries = self.read_directory_entries(entry.icb, dir_path)?;
+        let mut result: Vec<(String, bool)> = entries
+            .into_iter()
+            .map(|e| (e.name, e.is_directory))
+            .collect();
+        result.sort();
+        Ok(result)
     }
 
     fn file_slice(&self, _path: &str) -> Result<Option<IsoSlice>, ProfileError> {
@@ -433,6 +693,43 @@ fn read_root_icb(
     }
 
     parse_long_ad(&descriptor[400..416])
+}
+
+fn first_extent_byte_offset(
+    block: &[u8],
+    descriptor: &NodeDescriptor,
+    partition_start: u32,
+    block_size: u32,
+) -> Option<u64> {
+    let alloc_data = block.get(
+        descriptor.allocation_descriptors_offset
+            ..descriptor.allocation_descriptors_offset + descriptor.allocation_descriptors_length,
+    )?;
+    match descriptor.allocation_type {
+        ALLOCATION_SHORT => {
+            if alloc_data.len() < 8 {
+                return None;
+            }
+            let extent_length = le_u32(alloc_data, 0).ok()? & 0x3FFF_FFFF;
+            if extent_length == 0 {
+                return None;
+            }
+            let block_num = le_u32(alloc_data, 4).ok()?;
+            Some(u64::from(partition_start + block_num) * u64::from(block_size))
+        }
+        ALLOCATION_LONG => {
+            if alloc_data.len() < 16 {
+                return None;
+            }
+            let extent_length = le_u32(alloc_data, 0).ok()? & 0x3FFF_FFFF;
+            if extent_length == 0 {
+                return None;
+            }
+            let lbn = le_u32(alloc_data, 4).ok()?;
+            Some(u64::from(partition_start + lbn) * u64::from(block_size))
+        }
+        _ => None,
+    }
 }
 
 fn parse_node_descriptor(block: &[u8]) -> io::Result<NodeDescriptor> {

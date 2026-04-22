@@ -10,6 +10,7 @@ const WIMLIB_OPEN_FLAG_WRITE_ACCESS: c_int = 0x00000004;
 const WIMLIB_WRITE_FLAG_REBUILD: c_int = 0x00000040;
 const WIMLIB_COMPRESSION_TYPE_XPRESS: c_int = 1;
 const WIMLIB_EXPORT_FLAG_BOOT: c_int = 0x00000001;
+const WIMLIB_ADD_FLAG_REPLACE_IF_EXISTS: c_int = 0x00000200;
 const WIMLIB_ALL_IMAGES: c_int = -1;
 
 #[cfg(not(unix))]
@@ -128,7 +129,22 @@ impl Wim {
         host_path: &Path,
         wim_target_path: &str,
     ) -> Result<(), String> {
-        self.add_tree(image, host_path, wim_target_path)
+        let host_path = path_to_cstring(host_path)?;
+        let wim_target_path = CString::new(wim_target_path)
+            .map_err(|_| format!("error: invalid WIM path: {wim_target_path}"))?;
+        let code = unsafe {
+            wimlib_add_tree(
+                self.raw,
+                image,
+                host_path.as_ptr(),
+                wim_target_path.as_ptr(),
+                WIMLIB_ADD_FLAG_REPLACE_IF_EXISTS,
+            )
+        };
+        if code != 0 {
+            return Err(error_message("failed to update WIM image", code));
+        }
+        Ok(())
     }
 
     pub fn add_tree(

@@ -25,7 +25,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_timestamp(None)
+        .format_timestamp_millis()
         .init();
     match parse_args(env::args_os())? {
         CliCommand::Start(command) => run_start(command),

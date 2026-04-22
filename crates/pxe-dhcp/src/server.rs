@@ -117,7 +117,7 @@ impl ProxyDhcpServer {
                 packet
             }
             Err(err) => {
-                log::warn!("dhcp: dropping malformed packet from {}: {}", peer, err);
+                log::warn!("dropping malformed packet from {}: {}", peer, err);
                 return Ok(());
             }
         };

@@ -36,6 +36,17 @@ Only `pxe-proto` is implemented so far (Phase 1). The remaining crates are defin
 
 Primary platform target is modern UEFI hardware, with arm64 support treated as first-class alongside x86_64. Legacy BIOS support is lower priority than getting the UEFI boot path working cleanly on current hardware and VMs.
 
+### Default boot flow policy
+
+Use this as the generic assumption unless there is a clear compatibility reason to override it:
+- First stage: PXE firmware chainloads `iPXE` over TFTP
+- Second stage: `iPXE` boots over HTTP
+- Boot source handling should be minimal: detect the source, expose the needed assets, generate the smallest boot script needed, and avoid parsing or rewriting upstream GRUB configs unless required
+- TFTP is only the firmware-to-`iPXE` bridge by default; it should not be the main payload path
+- Prefer one consistent flow across UEFI and BIOS, even if the first-stage `iPXE` binary differs by firmware type
+
+Current implementation note: this is the intended default, but BIOS first-stage support may still lag UEFI in code.
+
 ### `pxe-proto` (implemented)
 
 Pure DHCP/PXE packet parsing and serialization. No I/O, no async, no external crates in production code (`std`-only). Key invariants:
@@ -48,15 +59,33 @@ Option 43 (`VendorSpecific`) is stored as raw bytes in `DhcpOption` and decoded 
 
 ### Planned crates (specs in `.docs/`)
 
-- **`pxe-profiles`** (Phase 2): ISO 9660 inspection → `BootProfile` + iPXE script generation. Detection heuristics are the most fragile part — test-first.
-- **`pxe-dhcp`** (Phase 3): ProxyDHCP only — injects boot params, never assigns IPs. The `build_offer`/`build_ack` pure functions are the primary test target; option 43 content is the #1 real-world failure point.
-- **`pxe-tftp`** (Phase 4): Read-only TFTP serving `ipxe.efi` and `boot.ipxe` from an in-memory `HashMap<String, Bytes>`.
-- **`pxe-http`** (Phase 6): HTTP serving kernel/initrd from ISO; must support range requests (iPXE requires them).
-- **`pxeasy` CLI** (Phase 5): `pxeasy start <iso-path> [--interface <iface>] [--bind <ip>]` — wires ProxyDHCP and TFTP together for the first boot to the iPXE prompt. HTTP integration follows in Phase 6.
+- **`pxe-profiles`** (Phase 2): ISO 9660 inspection → `BootProfile` + boot metadata needed for the default `iPXE` → HTTP flow. Detection heuristics are the most fragile part - test-first.
+- **`pxe-dhcp`** (Phase 3): ProxyDHCP only - injects boot params, never assigns IPs. By default it should point firmware at `iPXE`, then point `iPXE` at the HTTP boot script. The `build_offer`/`build_ack` pure functions are the primary test target; boot filename and option 43 content are the main failure points.
+- **`pxe-tftp`** (Phase 4): Read-only TFTP serving the first-stage `iPXE` binary and only tiny compatibility files when justified.
+- **`pxe-http`** (Phase 5): HTTP serving kernel/initrd and source payloads for the main boot path. Must support range requests.
+- **`pxeasy` CLI** (Phase 6): `pxeasy start <iso-path> [--interface <iface>] [--bind <ip>]` - wires ProxyDHCP, TFTP, and HTTP together for PXE → `iPXE` → HTTP boot.
+
+## Storage mode constraints
+
+**Hard constraint: the booting machine must never need more RAM than Ubuntu requires to run (~4 GB for desktop, ~2 GB for server).** The PXE mechanism must not add to that requirement.
+
+This rules out any approach that downloads the ISO or squashfs to client RAM before mounting:
+
+| Mode | How casper finds the filesystem | Client RAM overhead | Works? |
+|------|--------------------------------|---------------------|--------|
+| NFS  | Mounts squashfs over NFS, reads blocks on demand | ~0 | ✓ Reliable |
+| iSCSI | Exposes the ISO as a remote block device, reads blocks on demand | ~0 | ✓ Requires iSCSI in initrd |
+| HTTP `fetch=<squashfs>` | Downloads squashfs (~2.5 GB) to tmpfs, then mounts | ~2.5 GB | ✓ Within constraint — squashfs IS the OS, same RAM either way |
+| HTTP `url=<iso>` | Downloads entire ISO to tmpfs, then loop-mounts | = ISO size (2–6 GB) | ✗ Violates constraint — ISO is much larger than squashfs |
+
+**Do not use `url=<iso>`.** Always use `fetch=<squashfs>` for HTTP live ISO boot.
+
+For live ISO boot, use `--storage nfs` (always works) or `--storage iscsi` (requires the initrd to include iSCSI support).
 
 ## Code standards
 
 - No `unwrap()` or `expect()` in non-test code — use `?` or explicit error handling
-- iPXE script generation must use `\n` (LF only), no trailing whitespace — iPXE is sensitive
+- Bootloader scripts, if added later, must use `\n` (LF only), no trailing whitespace
 - `cargo clippy -- -D warnings` must pass before a phase is considered done
 - Make atomic, meaningful commits as you do work.
+- @STANDARDS.md

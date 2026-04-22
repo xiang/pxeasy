@@ -18,6 +18,8 @@ use std::{
     thread,
 };
 
+use log::{debug, info};
+
 use boot::{add_binary_asset, add_ipxe_script_asset, build_boot_assets};
 use bytes::Bytes;
 pub use network::{resolve_network, NetworkSelection};
@@ -35,13 +37,14 @@ use wim::Wim;
 const DEFAULT_HTTP_PORT: u16 = 8080;
 const DEFAULT_SMB_PORT: u16 = 445;
 const WINDOWS_SHARE_NAME: &str = "windows";
-const WINDOWS_SOURCE_WINPE_IMAGE: i32 = 1;
+const WINDOWS_SOURCE_WINPE_IMAGE: i32 = 2;
 const WINDOWS_CUSTOM_WINPE_IMAGE: i32 = 1;
-const WINDOWS_VIRTIO_ROOT: &str = "/Users/sfortner/work/lab/pxeasy/assets/windows/virtio-win";
-const WINDOWS_STARTNET_TEMPLATE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/windows/startnet.cmd"
-);
+const DEFAULT_WINDOWS_STARTNET_TEMPLATE: &str =
+    include_str!("../../../templates/windows/startnet.cmd");
+const DEFAULT_WINDOWS_WINPESHL_TEMPLATE: &str =
+    include_str!("../../../templates/windows/winpeshl.ini");
+const DEFAULT_WINDOWS_BOOTSTRAP_TEMPLATE: &str =
+    include_str!("../../../templates/windows/pxeasy-bootstrap.cmd");
 
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -597,12 +600,12 @@ fn run_windows_start(
         },
     )?;
 
-    let smb = SmbServer::bind(SmbConfig {
-        bind_ip: network.ip,
-        bind_port: DEFAULT_SMB_PORT,
-        share_name: WINDOWS_SHARE_NAME.to_string(),
+    let smb = SmbServer::bind(SmbConfig::new(
+        network.ip,
+        DEFAULT_SMB_PORT,
+        WINDOWS_SHARE_NAME.to_string(),
         source_path,
-    })
+    ))
     .map_err(smb_bind_error)?;
     let smb_addr = smb
         .local_addr()
@@ -825,7 +828,14 @@ fn prepare_windows_boot_wim(
         .as_secs();
 
     let virtio_drivers = windows_virtio_drivers(arch)?;
-    let startnet_script = windows_startnet_cmd(server_ip, &virtio_drivers)?;
+    let startnet_script = windows_startnet_cmd()?;
+    let winpeshl_ini = Some(render_windows_template(
+        "winpeshl.ini",
+        DEFAULT_WINDOWS_WINPESHL_TEMPLATE,
+        server_ip,
+    )?);
+    let bootstrap_script = windows_bootstrap_cmd(server_ip, &virtio_drivers)?;
+
     let cache_dir = PathBuf::from(format!("{}.pxeasy", source_path.display()));
     fs::create_dir_all(&cache_dir)
         .map_err(|err| format!("error: failed to create Windows cache dir: {err}"))?;
@@ -833,26 +843,34 @@ fn prepare_windows_boot_wim(
     let cached_wim = cache_dir.join("boot.wim");
     let cached_meta = cache_dir.join("boot.wim.meta");
     let expected_meta = format!(
-        "size={}\nmtime={modified_secs}\nserver_ip={server_ip}\narch={}\nvirtio_drivers={}\nstartnet_hash={:016x}\n",
+        "size={}\nmtime={modified_secs}\nserver_ip={server_ip}\nshare_name={WINDOWS_SHARE_NAME}\narch={}\nvirtio_drivers={}\nstartnet_hash={:016x}\nbootstrap_hash={:016x}\nwinpeshl_hash={}\nsource_image={WINDOWS_SOURCE_WINPE_IMAGE}\n",
         source_metadata.len(),
         arch.slug().unwrap_or("unknown"),
         windows_virtio_meta(&virtio_drivers),
-        stable_hash(&startnet_script)
+        stable_hash(&startnet_script),
+        stable_hash(&bootstrap_script),
+        winpeshl_ini.as_ref().map(|s| format!("{:016x}", stable_hash(s))).unwrap_or_else(|| "none".to_string()),
     );
 
     if cached_wim.exists() {
         if let Ok(existing_meta) = fs::read_to_string(&cached_meta) {
             if existing_meta == expected_meta {
+                debug!("using cached Windows boot image: {}", cached_wim.display());
                 return Ok(cached_wim);
             }
         }
     }
 
+    info!("preparing custom Windows boot image (this may take a minute)...");
     let tempdir = tempfile::tempdir()
         .map_err(|err| format!("error: failed to create temporary directory: {err}"))?;
     let temp_boot_wim = tempdir.path().join("boot.wim");
     let startnet_cmd = tempdir.path().join("startnet.cmd");
+    let bootstrap_cmd = tempdir.path().join("pxeasy-bootstrap.cmd");
+    let winpeshl_ini_path = tempdir.path().join("winpeshl.ini");
     let source_boot_wim = tempdir.path().join("source-boot.wim");
+
+    debug!("extracting source boot.wim from ISO...");
     let boot_wim_bytes =
         load_file(source_path, boot_wim_path).map_err(|err| profile_error(source_path, err))?;
 
@@ -860,56 +878,138 @@ fn prepare_windows_boot_wim(
         .map_err(|err| format!("error: failed to write temporary source boot.wim: {err}"))?;
     fs::write(&startnet_cmd, startnet_script)
         .map_err(|err| format!("error: failed to write startnet.cmd: {err}"))?;
+    fs::write(&bootstrap_cmd, bootstrap_script)
+        .map_err(|err| format!("error: failed to write pxeasy-bootstrap.cmd: {err}"))?;
+    if let Some(content) = &winpeshl_ini {
+        debug!("writing custom winpeshl.ini to boot image...");
+        fs::write(&winpeshl_ini_path, content)
+            .map_err(|err| format!("error: failed to write winpeshl.ini: {err}"))?;
+    }
 
+    debug!("exporting WIM image...");
     Wim::export_image_to_new_wim(&source_boot_wim, WINDOWS_SOURCE_WINPE_IMAGE, &temp_boot_wim)?;
 
     let mut wim = Wim::open_for_update(&temp_boot_wim)?;
+    debug!("injecting custom startnet.cmd...");
     wim.replace_file(
         WINDOWS_CUSTOM_WINPE_IMAGE,
         &startnet_cmd,
         "/Windows/System32/startnet.cmd",
     )?;
+    debug!("injecting custom pxeasy-bootstrap.cmd...");
+    wim.replace_file(
+        WINDOWS_CUSTOM_WINPE_IMAGE,
+        &bootstrap_cmd,
+        "/Windows/System32/pxeasy-bootstrap.cmd",
+    )?;
+    if winpeshl_ini.is_some() {
+        debug!("injecting custom winpeshl.ini...");
+        wim.replace_file(
+            WINDOWS_CUSTOM_WINPE_IMAGE,
+            &winpeshl_ini_path,
+            "/Windows/System32/winpeshl.ini",
+        )?;
+    }
     for driver in &virtio_drivers {
+        debug!("injecting virtio driver: {}", driver.wim_dir);
         wim.add_tree(
             WINDOWS_CUSTOM_WINPE_IMAGE,
             &driver.host_dir,
             &driver.wim_dir,
         )?;
     }
+    debug!("finalizing WIM (rebuilding)...");
     wim.overwrite()?;
 
+    debug!("caching prepared boot image...");
     fs::copy(&temp_boot_wim, &cached_wim)
         .map_err(|err| format!("error: failed to cache prepared boot.wim: {err}"))?;
     fs::write(&cached_meta, expected_meta)
         .map_err(|err| format!("error: failed to write boot.wim cache metadata: {err}"))?;
 
+    info!("Windows boot image prepared successfully");
     Ok(cached_wim)
 }
 
-fn windows_startnet_cmd(
+fn windows_startnet_cmd() -> Result<String, String> {
+    let template = load_windows_template("startnet.cmd", DEFAULT_WINDOWS_STARTNET_TEMPLATE)?;
+    Ok(template.replace("\r\n", "\n").replace('\n', "\r\n"))
+}
+
+fn windows_bootstrap_cmd(
     server_ip: Ipv4Addr,
     virtio_drivers: &[WindowsVirtioDriver],
 ) -> Result<String, String> {
-    let template = fs::read_to_string(WINDOWS_STARTNET_TEMPLATE).map_err(|err| {
-        format!(
-            "error: failed to read Windows startnet template at {}: {err}",
-            WINDOWS_STARTNET_TEMPLATE
-        )
-    })?;
-
+    let template = load_windows_template(
+        "pxeasy-bootstrap.cmd",
+        DEFAULT_WINDOWS_BOOTSTRAP_TEMPLATE,
+    )?;
     let mut drvload_lines = String::new();
     for driver in virtio_drivers {
+        if !driver.winpe_load {
+            continue;
+        }
         for inf_path in &driver.inf_paths {
             drvload_lines.push_str(&format!("drvload X:{inf_path}\n"));
         }
     }
+    let post_drvload_network_init = if drvload_lines.is_empty() {
+        String::new()
+    } else {
+        "wpeutil InitializeNetwork\n".to_string()
+    };
 
     let script = template
         .replace("{{DRVLOAD_LINES}}", &drvload_lines)
+        .replace(
+            "{{POST_DRVLOAD_NETWORK_INIT}}",
+            &post_drvload_network_init,
+        )
         .replace("{{SERVER_IP}}", &server_ip.to_string())
         .replace("{{SHARE_NAME}}", WINDOWS_SHARE_NAME);
 
     Ok(script.replace("\r\n", "\n").replace('\n', "\r\n"))
+}
+
+fn render_windows_template(
+    template_name: &str,
+    default_template: &str,
+    server_ip: Ipv4Addr,
+) -> Result<String, String> {
+    let template = load_windows_template(template_name, default_template)?;
+    Ok(template
+        .replace("{{SERVER_IP}}", &server_ip.to_string())
+        .replace("{{SHARE_NAME}}", WINDOWS_SHARE_NAME)
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n"))
+}
+
+fn load_windows_template(template_name: &str, default_template: &str) -> Result<String, String> {
+    let template_path = ensure_windows_template(template_name, default_template)?;
+    fs::read_to_string(&template_path).map_err(|err| {
+        format!(
+            "error: failed to read Windows template {}: {err}",
+            template_path.display()
+        )
+    })
+}
+
+fn ensure_windows_template(template_name: &str, default_template: &str) -> Result<PathBuf, String> {
+    let template_dir = pxeasy_home_dir()?.join("templates/windows");
+    fs::create_dir_all(&template_dir)
+        .map_err(|err| format!("error: failed to create Windows template dir: {err}"))?;
+
+    let template_path = template_dir.join(template_name);
+    if !template_path.exists() {
+        fs::write(&template_path, default_template).map_err(|err| {
+            format!(
+                "error: failed to initialize Windows template {}: {err}",
+                template_path.display()
+            )
+        })?;
+    }
+
+    Ok(template_path)
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -922,20 +1022,18 @@ struct WindowsVirtioDriver {
     host_dir: PathBuf,
     wim_dir: String,
     inf_paths: Vec<String>,
+    winpe_load: bool,
 }
 
 fn windows_virtio_drivers(arch: Architecture) -> Result<Vec<WindowsVirtioDriver>, String> {
-    if arch != Architecture::Arm64 {
+    let Some(root) = windows_virtio_root()? else {
         return Ok(Vec::new());
-    }
-
-    let root = PathBuf::from(WINDOWS_VIRTIO_ROOT);
-    if !root.is_dir() {
-        return Err(format!(
-            "error: expected virtio driver root at {}",
-            root.display()
-        ));
-    }
+    };
+    let arch_subdir = match arch {
+        Architecture::Arm64 => "ARM64",
+        Architecture::Amd64 => "amd64",
+        Architecture::Unknown => return Ok(Vec::new()),
+    };
 
     let mut drivers = Vec::new();
     let entries = fs::read_dir(&root)
@@ -951,7 +1049,7 @@ fn windows_virtio_drivers(arch: Architecture) -> Result<Vec<WindowsVirtioDriver>
             continue;
         }
 
-        let host_dir = entry.path().join("w11").join("ARM64");
+        let host_dir = entry.path().join("w11").join(arch_subdir);
         if !host_dir.is_dir() {
             continue;
         }
@@ -990,22 +1088,40 @@ fn windows_virtio_drivers(arch: Architecture) -> Result<Vec<WindowsVirtioDriver>
         }
         inf_paths.sort();
 
+        let name_lower = driver_name.to_lowercase();
+        let winpe_load =
+            name_lower == "netkvm" || name_lower == "vioscsi" || name_lower == "viostor";
         drivers.push(WindowsVirtioDriver {
             host_dir,
             wim_dir: format!("/Drivers/{driver_name}"),
             inf_paths,
+            winpe_load,
         });
     }
 
     drivers.sort_by(|left, right| left.wim_dir.cmp(&right.wim_dir));
-    if drivers.is_empty() {
-        return Err(format!(
-            "error: no ARM64 virtio driver directories found under {}",
-            root.display()
-        ));
-    }
 
     Ok(drivers)
+}
+
+fn windows_virtio_root() -> Result<Option<PathBuf>, String> {
+    if let Some(root) = std::env::var_os("PXEASY_WINDOWS_VIRTIO_ROOT") {
+        let path = PathBuf::from(root);
+        if !path.is_dir() {
+            return Err(format!(
+                "error: PXEASY_WINDOWS_VIRTIO_ROOT is not a directory: {}",
+                path.display()
+            ));
+        }
+        return Ok(Some(path));
+    }
+
+    let path = pxeasy_home_dir()?.join("dev/windows/virtio-win");
+    if path.is_dir() {
+        return Ok(Some(path));
+    }
+
+    Ok(None)
 }
 
 fn windows_virtio_meta(drivers: &[WindowsVirtioDriver]) -> String {
@@ -1021,7 +1137,7 @@ fn windows_virtio_meta(drivers: &[WindowsVirtioDriver]) -> String {
 }
 
 fn fetch_wimboot(arch: Architecture) -> Result<PathBuf, String> {
-    let cache_dir = pxeasy_cache_dir()?.join("cache");
+    let cache_dir = pxeasy_home_dir()?.join("cache");
     fs::create_dir_all(&cache_dir)
         .map_err(|err| format!("error: failed to create wimboot cache dir: {err}"))?;
 
@@ -1058,11 +1174,11 @@ fn fetch_wimboot(arch: Architecture) -> Result<PathBuf, String> {
     Ok(cached_wimboot)
 }
 
-fn pxeasy_cache_dir() -> Result<PathBuf, String> {
+fn pxeasy_home_dir() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".pxeasy"))
-        .ok_or_else(|| "error: HOME is not set; cannot resolve ~/.pxeasy cache".to_string())
+        .ok_or_else(|| "error: HOME is not set; cannot resolve ~/.pxeasy".to_string())
 }
 
 fn resolve_profile(source_path: &Path) -> Result<BootProfile, String> {

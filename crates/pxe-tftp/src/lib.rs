@@ -89,7 +89,7 @@ impl TftpServer {
         let mut buf = [0u8; 65_535];
         let (len, peer) = self.socket.recv_from(&mut buf)?;
         if let Err(err) = self.handle_packet(peer, &buf[..len]) {
-            log::warn!("tftp: failed to handle packet from {}: {}", peer, err);
+            log::warn!("failed to handle packet from {}: {}", peer, err);
         }
         Ok(())
     }
@@ -98,7 +98,7 @@ impl TftpServer {
         let request = match RequestPacket::parse(packet) {
             Ok(Some(request)) => request,
             Ok(None) => {
-                log::warn!("tftp: dropping malformed packet from {}", peer);
+                log::warn!("dropping malformed packet from {}", peer);
                 return Ok(());
             }
             Err(response) => {
@@ -124,7 +124,7 @@ impl TftpServer {
     }
 
     fn handle_rrq(&self, peer: SocketAddr, request: RequestPacket) -> io::Result<()> {
-        log::debug!("tftp: rrq from {} for {}", peer, request.filename);
+        log::debug!("rrq from {} for {}", peer, request.filename);
         let path = match validate_path(&request.filename) {
             Ok(path) => path,
             Err((code, message)) => {
@@ -141,7 +141,7 @@ impl TftpServer {
         {
             Some(file) => file.clone(),
             None => {
-                log::warn!("tftp: requested unknown file {}", path);
+                log::warn!("requested unknown file {}", path);
                 let response = encode_error(ERROR_FILE_NOT_FOUND, "file not found");
                 self.socket.send_to(&response, peer)?;
                 return Ok(());
@@ -161,7 +161,7 @@ impl TftpServer {
         socket.set_read_timeout(Some(Duration::from_secs(u64::from(transfer.timeout_secs))))?;
         thread::spawn(move || {
             if let Err(err) = run_transfer(socket, peer, file, transfer) {
-                log::warn!("tftp: transfer to {} failed: {}", peer, err);
+                log::warn!("transfer to {} failed: {}", peer, err);
             }
         });
         Ok(())

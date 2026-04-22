@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 log = "0.4"
 pxe-profiles = { path = "../pxe-profiles" }
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"

@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
@@ -31,6 +33,120 @@ pub fn run_guest(
 ) -> Result<GuestReport> {
     match scenario {
         QemuScenario::Arm64Uefi => run_arm64_uefi(success_pattern, timeout, interrupted),
+    }
+}
+
+pub fn run_windows_arm64_manual(
+    disk_path: &Path,
+    interrupted: Arc<AtomicBool>,
+) -> Result<GuestReport> {
+    ensure_windows_disk(disk_path)?;
+
+    let firmware = arm64_firmware()?;
+    let ipxe_efi = fetch_ipxe_disk_efi("arm64")?;
+    let ipxe_disk = create_uefi_boot_disk(&ipxe_efi)?;
+    let vars_file = fresh_vars()?;
+
+    let qemu_bin =
+        std::env::var("PXE_HARNESS_QEMU_BIN").unwrap_or_else(|_| "qemu-system-aarch64".to_string());
+    let qemu_sudo = std::env::var("PXE_HARNESS_QEMU_SUDO")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let netdev = std::env::var("PXE_HARNESS_QEMU_NETDEV")
+        .unwrap_or_else(|_| "vmnet-bridged,id=net0,ifname=en0".to_string());
+    let qemu_log = disk_path.with_extension("qemu.log");
+
+    let mut cmd = if qemu_sudo {
+        let mut cmd = Command::new("sudo");
+        cmd.arg("-n").arg(&qemu_bin);
+        cmd
+    } else {
+        Command::new(&qemu_bin)
+    };
+    cmd.args([
+        "-machine",
+        "virt",
+        "-cpu",
+        "host",
+        "-accel",
+        "hvf",
+        "-smp",
+        "cpus=8,sockets=1,cores=8,threads=1",
+        "-m",
+        "8G",
+        "-boot",
+        "n",
+        "-no-reboot",
+        "-no-shutdown",
+        "-device",
+        "virtio-net-pci,netdev=net0,romfile=",
+        "-netdev",
+        "-device",
+        "qemu-xhci,id=usb-bus",
+        "-device",
+        "usb-tablet,bus=usb-bus.0",
+        "-device",
+        "usb-kbd,bus=usb-bus.0",
+    ]);
+    cmd.arg(&netdev);
+    if cfg!(target_os = "macos") {
+        cmd.args(["-display", "cocoa"]);
+    } else {
+        cmd.args(["-display", "gtk"]);
+    }
+    cmd.args(["-serial", "stdio"]);
+    cmd.arg("-drive").arg(format!(
+        "if=pflash,format=raw,unit=0,file={},readonly=on",
+        firmware.display()
+    ));
+    cmd.arg("-drive").arg(format!(
+        "if=pflash,format=raw,unit=1,file={}",
+        vars_file.path().display()
+    ));
+    cmd.arg("-drive").arg(format!(
+        "if=virtio,format=raw,file={}",
+        ipxe_disk.path().display()
+    ));
+    cmd.arg("-drive").arg(format!(
+        "if=none,id=installdisk,format=raw,file={}",
+        disk_path.display()
+    ));
+    cmd.args(["-device", "nvme,serial=pxeasy0,drive=installdisk"]);
+    cmd.arg("-D").arg(&qemu_log).args(["-d", "guest_errors"]);
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    eprintln!(
+        "[pxe-harness] launching Windows ARM64 QEMU with disk {}",
+        disk_path.display()
+    );
+    eprintln!("[pxe-harness] qemu binary: {qemu_bin}");
+    eprintln!("[pxe-harness] qemu sudo: {qemu_sudo}");
+    eprintln!("[pxe-harness] qemu netdev: {netdev}");
+    eprintln!("[pxe-harness] qemu debug log: {}", qemu_log.display());
+    eprintln!("[pxe-harness] stop with Ctrl-C");
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to launch qemu-system-aarch64 via sudo -n")?;
+    let start = Instant::now();
+
+    loop {
+        if interrupted.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::anyhow!("interrupted"));
+        }
+
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "QEMU exited with status {status}");
+            return Ok(GuestReport {
+                duration: start.elapsed(),
+            });
+        }
+
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -79,6 +195,25 @@ fn fresh_vars() -> Result<tempfile::NamedTempFile> {
     let buf = vec![0xFFu8; 64 * 1024 * 1024];
     file.write_all(&buf)?;
     Ok(file)
+}
+
+fn ensure_windows_disk(path: &Path) -> Result<()> {
+    const DISK_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("failed to create disk image {}", path.display()))?;
+    if file.metadata()?.len() < DISK_SIZE_BYTES {
+        file.set_len(DISK_SIZE_BYTES)?;
+    }
+    Ok(())
 }
 
 fn attach_ipxe_disk(qemu: QemuBuilder, ipxe_disk: &tempfile::NamedTempFile) -> QemuBuilder {

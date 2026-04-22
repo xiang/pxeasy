@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::qemu::run_guest;
+use crate::qemu::{run_guest, run_windows_arm64_manual};
 use crate::scenarios::{Scenario, SourceBuildDef};
 use crate::server::ServerHandle;
 
@@ -81,6 +81,55 @@ pub fn run_smoke(scenario: Scenario, options: RunOptions) -> Result<()> {
                 eprintln!("{line}");
             }
             Err(err).with_context(|| format!("scenario {} failed", scenario.name))
+        }
+    }
+}
+
+pub fn run_windows_arm64_manual_with_server(
+    source_path: PathBuf,
+    disk_path: PathBuf,
+    options: RunOptions,
+) -> Result<()> {
+    anyhow::ensure!(
+        source_path.exists(),
+        "missing Windows source: {}",
+        source_path.display()
+    );
+
+    if options.build {
+        build_pxeasy(&options.repo_root, &options.target_dir)?;
+    }
+
+    let pxeasy_bin = options.target_dir.join("debug/pxeasy");
+    if !pxeasy_bin.exists() {
+        anyhow::bail!("missing built pxeasy binary at {}", pxeasy_bin.display());
+    }
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    install_ctrlc(Arc::clone(&interrupted))?;
+
+    let mut server = ServerHandle::start_with_sudo(&pxeasy_bin, &source_path, &[], &interrupted)?;
+    if interrupted.load(Ordering::SeqCst) {
+        anyhow::bail!("interrupted before guest launch");
+    }
+
+    let result = run_windows_arm64_manual(&disk_path, Arc::clone(&interrupted));
+    let _ = server.stop();
+
+    match result {
+        Ok(report) => {
+            println!(
+                "[pxe-harness] Windows ARM64 manual run exited after {:?}",
+                report.duration
+            );
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("[pxe-harness] server log tail:");
+            for line in server.log_tail() {
+                eprintln!("{line}");
+            }
+            Err(err)
         }
     }
 }

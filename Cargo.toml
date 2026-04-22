@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/pxeasy-gui",
     "crates/pxe-proto",
     "crates/pxe-profiles",
     "crates/pxe-dhcp",

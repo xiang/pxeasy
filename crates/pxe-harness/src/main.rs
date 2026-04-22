@@ -8,12 +8,20 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use pico_args::Arguments;
 
-use runner::{run_smoke, RunOptions};
+use runner::{run_smoke, run_windows_arm64_manual_with_server, RunOptions};
 use scenarios::{all_scenarios, scenario_by_name};
 
 enum Command {
     List,
-    Smoke { name: String, no_build: bool },
+    Smoke {
+        name: String,
+        no_build: bool,
+    },
+    WindowsArm64 {
+        source_path: PathBuf,
+        disk_path: Option<PathBuf>,
+        no_build: bool,
+    },
 }
 
 fn main() {
@@ -48,6 +56,24 @@ fn run() -> Result<()> {
                 },
             )
         }
+        Command::WindowsArm64 {
+            source_path,
+            disk_path,
+            no_build,
+        } => {
+            let target_dir = repo_root.join("target/pxe-harness");
+            let disk_path =
+                disk_path.unwrap_or_else(|| target_dir.join("windows-arm64-installer.raw"));
+            run_windows_arm64_manual_with_server(
+                source_path,
+                disk_path,
+                RunOptions {
+                    build: !no_build,
+                    repo_root,
+                    target_dir,
+                },
+            )
+        }
     }
 }
 
@@ -62,6 +88,18 @@ fn parse_command(mut args: Arguments) -> Result<Command> {
                 .free_from_str::<String>()
                 .context("usage: pxe-harness smoke <scenario> [--no-build]")?;
             Command::Smoke { name, no_build }
+        }
+        "windows-arm64" => {
+            let no_build = args.contains("--no-build");
+            let disk_path = args.opt_value_from_str::<_, PathBuf>("--disk")?;
+            let source_path = args.free_from_str::<PathBuf>().context(
+                "usage: pxe-harness windows-arm64 <iso-path> [--disk <raw-disk>] [--no-build]",
+            )?;
+            Command::WindowsArm64 {
+                source_path,
+                disk_path,
+                no_build,
+            }
         }
         other => anyhow::bail!("unknown command: {other}"),
     };

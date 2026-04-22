@@ -73,7 +73,7 @@ impl HttpServer {
                     // Accepted sockets inherit the listener's non-blocking flag on macOS.
                     // Connection threads use blocking I/O, so reset it explicitly.
                     if let Err(err) = stream.set_nonblocking(false) {
-                        log::warn!("http: failed to set stream blocking: {}", err);
+                        log::warn!("failed to set stream blocking: {}", err);
                         continue;
                     }
                     let assets = Arc::clone(&self.assets);
@@ -83,7 +83,7 @@ impl HttpServer {
                             if err.kind() != io::ErrorKind::BrokenPipe
                                 && err.kind() != io::ErrorKind::ConnectionReset
                             {
-                                log::warn!("http: connection failed: {}", err);
+                                log::warn!("connection failed: {}", err);
                             }
                         }
                     });
@@ -138,7 +138,7 @@ fn handle_connection(mut stream: TcpStream, assets: &HashMap<String, HttpAsset>)
             b"method not allowed",
             head_only,
         )?;
-        log::debug!("http: {} {} from {} -> 405", method, path, peer);
+        log::debug!("{} {} from {} -> 405", method, path, peer);
         return Ok(());
     }
 
@@ -152,7 +152,7 @@ fn handle_connection(mut stream: TcpStream, assets: &HashMap<String, HttpAsset>)
             b"ok\n",
             head_only,
         )?;
-        log::trace!("http: {} {} from {} -> 200", method, path, peer);
+        log::trace!("{} {} from {} -> 200", method, path, peer);
         return Ok(());
     }
 
@@ -175,7 +175,7 @@ fn handle_connection(mut stream: TcpStream, assets: &HashMap<String, HttpAsset>)
     };
     log::log!(
         level,
-        "http: {} {} from {} range={:?}",
+        "{} {} from {} range={:?}",
         method,
         path,
         peer,
@@ -194,7 +194,7 @@ fn handle_connection(mut stream: TcpStream, assets: &HashMap<String, HttpAsset>)
                 b"not found",
                 head_only,
             )?;
-            log::warn!("http: {} {} from {} -> 404", method, path, peer);
+            log::warn!("{} {} from {} -> 404", method, path, peer);
             return Ok(());
         }
     };
@@ -202,7 +202,7 @@ fn handle_connection(mut stream: TcpStream, assets: &HashMap<String, HttpAsset>)
     match serve_asset(&mut stream, path, asset, range_header.as_deref(), head_only) {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
-            log::warn!("http: {} {} from {} -> 416 ({})", method, path, peer, err);
+            log::warn!("{} {} from {} -> 416 ({})", method, path, peer, err);
             send_response(
                 &mut stream,
                 (416, "Range Not Satisfiable"),
@@ -214,7 +214,7 @@ fn handle_connection(mut stream: TcpStream, assets: &HashMap<String, HttpAsset>)
             )
         }
         Err(err) => {
-            log::warn!("http: {} {} from {} -> 500 ({})", method, path, peer, err);
+            log::warn!("{} {} from {} -> 500 ({})", method, path, peer, err);
             send_response(
                 &mut stream,
                 (500, "Internal Server Error"),
@@ -259,7 +259,7 @@ fn serve_asset(
             };
             log::log!(
                 level,
-                "http: serving memory {} len={} body_len={} range={:?} head_only={}",
+                "serving memory {} len={} body_len={} range={:?} head_only={}",
                 request_path,
                 full_len,
                 body_len,
@@ -344,7 +344,7 @@ fn serve_sliced_file(
     };
     log::log!(
         level,
-        "http: serving file {} src={} offset={} len={} body_len={} range={:?} head_only={}",
+        "serving file {} src={} offset={} len={} body_len={} range={:?} head_only={}",
         request_path,
         path.display(),
         offset,

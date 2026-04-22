@@ -8,5 +8,10 @@
 .vscode/
 .idea/
 
-# Docs (private specs)
+# local stuff
 .docs/
+STANDARDS.md
+
+/assets/
+
+
