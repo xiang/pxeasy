@@ -600,7 +600,7 @@ impl Allocator {
         loop {
             let cg = self.current_cg;
             let base = cg as u64 * layout.fpg as u64;
-            let end = base + layout.fpg as u64;
+            let end = (base + layout.fpg as u64).min(layout.fs_size as u64);
 
             if self.next_frag_per_cg[cg] + frags as u64 <= end {
                 let addr = self.next_frag_per_cg[cg];
@@ -635,24 +635,24 @@ mod tests {
 
     #[test]
     fn test_ufs_writer_basic() -> Result<(), UfsError> {
-        let temp_source = tempdir().map_err(|e| UfsError::Io(e))?;
+        let temp_source = tempdir().map_err(UfsError::Io)?;
         let source_path = temp_source.path();
-        
+
         // Create some files and directories
-        fs::create_dir(source_path.join("boot")).map_err(|e| UfsError::Io(e))?;
-        fs::write(source_path.join("boot/loader.conf"), b"test_content").map_err(|e| UfsError::Io(e))?;
-        fs::write(source_path.join("hello.txt"), b"world").map_err(|e| UfsError::Io(e))?;
-        
-        let temp_out = tempdir().map_err(|e| UfsError::Io(e))?;
+        fs::create_dir(source_path.join("boot")).map_err(UfsError::Io)?;
+        fs::write(source_path.join("boot/loader.conf"), b"test_content").map_err(UfsError::Io)?;
+        fs::write(source_path.join("hello.txt"), b"world").map_err(UfsError::Io)?;
+
+        let temp_out = tempdir().map_err(UfsError::Io)?;
         let output_img = temp_out.path().join("test.img");
-        
+
         let writer = UfsWriter::new(10 * 1024 * 1024, "TESTVOL"); // 10MB
         writer.write(source_path, &output_img)?;
-        
+
         assert!(output_img.exists());
-        let meta = fs::metadata(&output_img).map_err(|e| UfsError::Io(e))?;
+        let meta = fs::metadata(&output_img).map_err(UfsError::Io)?;
         assert_eq!(meta.len(), 10 * 1024 * 1024);
-        
+
         Ok(())
     }
 }

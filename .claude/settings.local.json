@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh *)",
+      "Bash(tshark -r /tmp/winpe-smb-good.pcap -Y \"smb2.cmd == 14\" -V)",
+      "Bash(tshark *)"
+    ]
+  }
+}

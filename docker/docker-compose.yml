@@ -1,0 +1,18 @@
+services:
+  samba:
+    build: .
+    container_name: samba-guest-test
+    ports:
+      - "445:445"
+      - "139:139"
+      - "137:137/udp"
+      - "138:138/udp"
+    volumes:
+      - ./share:/share
+      - ../assets/windows/extracted:/mnt/windows
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

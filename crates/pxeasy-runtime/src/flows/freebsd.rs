@@ -19,6 +19,7 @@ use crate::{
 };
 
 const FREEBSD_MFS_DISK_SIZE: u64 = 1024 * 1024 * 1024; // 1GB default
+const FREEBSD_UFS_BLOCK_SIZE: u64 = 32768; // 32KB
 
 pub fn run_freebsd_start(
     source_path: PathBuf,
@@ -193,6 +194,7 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
     let mfsroot_img = tempdir.path().join("mfsroot.img");
     // Estimate size: sum of files + 20% overhead
     let mfsroot_size = dir_size(&mfsroot_dir)? + (50 * 1024 * 1024); // Add 50MB overhead
+    let mfsroot_size = mfsroot_size.div_ceil(FREEBSD_UFS_BLOCK_SIZE) * FREEBSD_UFS_BLOCK_SIZE;
     let ufs_writer = pxe_ufs::UfsWriter::new(mfsroot_size, "mfsroot");
     ufs_writer
         .write(&mfsroot_dir, &mfsroot_img)
@@ -231,6 +233,7 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
 
     // ROOT
     let root_size = dir_size(&root_dir)? + (64 * 1024 * 1024); // 64MB buffer
+    let root_size = root_size.div_ceil(FREEBSD_UFS_BLOCK_SIZE) * FREEBSD_UFS_BLOCK_SIZE;
     disk.add_partition(Partition {
         name: "FREEBSD_ROOT".to_string(),
         part_type: PartitionType::FreeBsdUfs,

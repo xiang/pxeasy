@@ -29,12 +29,15 @@ The project is in early development. Expect breaking changes, bugs, and incomple
 
 ### From Source
 
+Build the pxeasy binary:
 ```bash
 cargo build --release -p pxeasy
-sudo cp target/release/pxeasy /usr/local/bin/
 ```
+To run it, either use the `just` commands defined in the `justfile` (which handle `sudo` automatically for the `run` command) or invoke the `qemu-scenario.sh` script.
 
 ## Usage
+
+`pxeasy` requires root/admin privileges to bind to privileged ports (UDP 67 for DHCP, TCP 445 for SMB). Always run `pxeasy` with `sudo`.
 
 Start a boot session by pointing `pxeasy` to an ISO or boot image:
 
@@ -47,6 +50,15 @@ sudo pxeasy start Win11_English_x64.iso
 
 # Specify a network interface
 sudo pxeasy start --interface en0 ubuntu.iso
+```
+It is recommended to use the `just` commands or the `qemu-scenario.sh` script for development and testing.
+
+For local QEMU bring-up, use the shell runner:
+
+```bash
+./scripts/qemu-scenario.sh list
+./scripts/qemu-scenario.sh run ubuntu-arm64-nfs
+./scripts/qemu-scenario.sh windows-arm64 assets/windows/Win11_25H2_English_Arm64_v2.iso
 ```
 
 ### How it Works

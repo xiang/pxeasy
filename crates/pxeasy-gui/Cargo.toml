@@ -1,0 +1,13 @@
+[package]
+name = "pxeasy-gui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pxeasy-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.34"
+rfd = "0.17"
+pxeasy-core = { path = "../pxeasy-core" }

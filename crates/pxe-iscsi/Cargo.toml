@@ -1,8 +1,10 @@
 [package]
-name = "pxe-qemu"
+name = "pxe-iscsi"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0"
+log = "0.4"
+
+[dev-dependencies]
 tempfile = "3"
