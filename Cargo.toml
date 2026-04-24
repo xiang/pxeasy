@@ -12,8 +12,6 @@ members = [
     "crates/pxeasy",
     "crates/pxeasy-core",
     "crates/pxeasy-runtime",
-    "crates/pxe-qemu",
-    "crates/pxe-harness",
-    "crates/pxe-ufs",
+    "crates/pxe-ufs", "crates/pxe-diskimg", "crates/pxe-wim", "crates/pxe-iso",
 ]
 resolver = "2"

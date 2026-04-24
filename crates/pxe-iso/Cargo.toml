@@ -1,0 +1,9 @@
+[package]
+name = "pxe-iso"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cdfs = "0.2"
+anyhow = "1.0"
+libc = "0.2"

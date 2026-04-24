@@ -1,0 +1,18 @@
+[package]
+name = "pxe-diskimg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpt = "3.1"
+fatfs = "0.3"
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+fscommon = "0.1"
+pxe-ufs = { path = "../pxe-ufs" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+path = "src/lib.rs"

@@ -14,14 +14,13 @@ const WIMLIB_ADD_FLAG_REPLACE_IF_EXISTS: c_int = 0x00000200;
 const WIMLIB_ALL_IMAGES: c_int = -1;
 
 #[cfg(not(unix))]
-compile_error!("pxeasy-runtime wim wrapper currently supports Unix-like hosts only");
+compile_error!("pxe-wim wrapper currently supports Unix-like hosts only");
 
 #[repr(C)]
 struct WIMStruct {
     _private: [u8; 0],
 }
 
-#[link(name = "wim")]
 unsafe extern "C" {
     fn wimlib_create_new_wim(ctype: c_int, wim_ret: *mut *mut WIMStruct) -> c_int;
     fn wimlib_open_wim(

@@ -5,12 +5,17 @@ edition = "2021"
 
 [dependencies]
 bytes = "1"
+flate2 = "1"
 if-addrs = "0.13"
 log = "0.4"
 pxe-dhcp = { path = "../pxe-dhcp" }
+pxe-diskimg = { path = "../pxe-diskimg" }
 pxe-http = { path = "../pxe-http" }
+pxe-iso = { path = "../pxe-iso" }
 pxe-nfs = { path = "../pxe-nfs" }
 pxe-profiles = { path = "../pxe-profiles" }
 pxe-smb = { path = "../pxe-smb" }
 pxe-tftp = { path = "../pxe-tftp" }
+pxe-ufs = { path = "../pxe-ufs" }
+pxe-wim = { path = "../pxe-wim" }
 tempfile = "3"

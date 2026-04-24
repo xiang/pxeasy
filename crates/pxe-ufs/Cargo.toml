@@ -1,0 +1,15 @@
+[package]
+name = "pxe-ufs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Gemini CLI"]
+description = "Write-only UFS2 filesystem image writer"
+
+[dependencies]
+# std only as per spec
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "3"

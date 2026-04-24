@@ -1,14 +1,228 @@
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
-use crate::{normalize_path, IsoSlice, ProfileError, SourceFs};
+use cdfs::{DirectoryEntry, ExtraAttributes, ISO9660};
 
-const DEFAULT_AVDP_SECTOR: u64 = 256;
+#[derive(Debug)]
+pub enum IsoError {
+    Io(io::Error),
+    InvalidData(String),
+    NotFound(String),
+}
 
+impl std::fmt::Display for IsoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IsoError::Io(e) => write!(f, "IO error: {}", e),
+            IsoError::InvalidData(s) => write!(f, "Invalid data: {}", s),
+            IsoError::NotFound(s) => write!(f, "Not found: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for IsoError {}
+
+impl From<io::Error> for IsoError {
+    fn from(err: io::Error) -> Self {
+        IsoError::Io(err)
+    }
+}
+
+pub struct IsoSlice {
+    pub offset: u64,
+    pub length: u64,
+}
+
+pub trait SourceFs {
+    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, IsoError>;
+    fn path_exists(&self, path: &str) -> Result<bool, IsoError>;
+    fn list_files(&self, prefix: &str) -> Result<Vec<String>, IsoError>;
+    fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, IsoError>;
+    fn file_slice(&self, path: &str) -> Result<Option<IsoSlice>, IsoError>;
+    fn volume_label(&self) -> Option<String>;
+
+    fn extract_to(&self, dest: &Path) -> Result<(), IsoError> {
+        self.extract_recursive("/", dest)
+    }
+
+    fn extract_recursive(&self, dir_path: &str, dest: &Path) -> Result<(), IsoError> {
+        fs::create_dir_all(dest)?;
+        for (name, is_dir) in self.list_dir(dir_path)? {
+            let src_path = if dir_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", dir_path.trim_end_matches('/'), name)
+            };
+            let dest_path = dest.join(&name);
+
+            if is_dir {
+                self.extract_recursive(&src_path, &dest_path)?;
+            } else if let Some(content) = self.read_file(&src_path)? {
+                fs::write(dest_path, content)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct CdfsIso<R: cdfs::ISO9660Reader> {
+    iso: ISO9660<R>,
+    path: PathBuf,
+}
+
+impl CdfsIso<File> {
+    pub fn open(path: &Path) -> Result<Self, IsoError> {
+        let file = File::open(path)?;
+        let iso = ISO9660::new(file).map_err(|e| IsoError::InvalidData(e.to_string()))?;
+        Ok(Self {
+            iso,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl<R: cdfs::ISO9660Reader> SourceFs for CdfsIso<R> {
+    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, IsoError> {
+        match self
+            .iso
+            .open(path)
+            .map_err(|e| IsoError::InvalidData(e.to_string()))?
+        {
+            Some(DirectoryEntry::File(f)) => {
+                let mut buf = Vec::new();
+                f.read().read_to_end(&mut buf)?;
+                Ok(Some(buf))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn path_exists(&self, path: &str) -> Result<bool, IsoError> {
+        self.iso
+            .open(path)
+            .map(|entry| entry.is_some())
+            .map_err(|e| IsoError::InvalidData(e.to_string()))
+    }
+
+    fn list_files(&self, prefix: &str) -> Result<Vec<String>, IsoError> {
+        let mut out = Vec::new();
+        let prefix = normalize_path(prefix);
+        self.walk_dir("/", &prefix, &mut out)?;
+        out.sort();
+        Ok(out)
+    }
+
+    fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, IsoError> {
+        let entry = self
+            .iso
+            .open(dir_path)
+            .map_err(|e| IsoError::InvalidData(e.to_string()))?;
+        let Some(DirectoryEntry::Directory(dir)) = entry else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::new();
+        for entry_result in dir.contents() {
+            let entry = entry_result.map_err(|e| IsoError::InvalidData(e.to_string()))?;
+            let name = entry.identifier().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let is_dir = matches!(entry, DirectoryEntry::Directory(_));
+            result.push((name, is_dir));
+        }
+        result.sort();
+        Ok(result)
+    }
+
+    fn file_slice(&self, path: &str) -> Result<Option<IsoSlice>, IsoError> {
+        match self
+            .iso
+            .open(path)
+            .map_err(|e| IsoError::InvalidData(e.to_string()))?
+        {
+            Some(DirectoryEntry::File(f)) => {
+                let header = f.header();
+                Ok(Some(IsoSlice {
+                    offset: u64::from(header.extent_loc) * 2048,
+                    length: u64::from(header.extent_length),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn volume_label(&self) -> Option<String> {
+        let mut file = File::open(&self.path).ok()?;
+        // ISO 9660 PVD at sector 16 (offset 32768), volume identifier at offset 40 within PVD
+        file.seek(SeekFrom::Start(32768 + 40)).ok()?;
+        let mut buf = [0u8; 32];
+        file.read_exact(&mut buf).ok()?;
+        let label = std::str::from_utf8(&buf)
+            .ok()?
+            .trim_end()
+            .trim()
+            .to_string();
+        if label.is_empty() {
+            None
+        } else {
+            Some(label)
+        }
+    }
+}
+
+impl<R: cdfs::ISO9660Reader> CdfsIso<R> {
+    fn walk_dir(&self, path: &str, prefix: &str, out: &mut Vec<String>) -> Result<(), IsoError> {
+        let entry = self
+            .iso
+            .open(path)
+            .map_err(|e| IsoError::InvalidData(e.to_string()))?;
+
+        if let Some(DirectoryEntry::Directory(dir)) = entry {
+            for entry_result in dir.contents() {
+                let entry = entry_result.map_err(|e| IsoError::InvalidData(e.to_string()))?;
+
+                let name = entry.identifier();
+                if name == "." || name == ".." {
+                    continue;
+                }
+
+                let full_path = if path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", path.trim_end_matches('/'), name)
+                };
+
+                if full_path.starts_with(prefix) {
+                    if let DirectoryEntry::File(_) = entry {
+                        out.push(full_path.clone());
+                    }
+                }
+
+                if let DirectoryEntry::Directory(_) = entry {
+                    self.walk_dir(&full_path, prefix, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn normalize_path(path: &str) -> String {
+    let p = path.replace('\\', "/");
+    let mut normalized = p.trim_start_matches('/').trim_end_matches('/').to_string();
+    normalized.insert(0, '/');
+    if normalized == "//" {
+        "/".to_string()
+    } else {
+        normalized
+    }
+}
+
+// UDF Implementation
 const TAG_PRIMARY_VOLUME_DESCRIPTOR: u16 = 1;
 const TAG_ANCHOR_VOLUME_DESCRIPTOR_POINTER: u16 = 2;
 const TAG_PARTITION_DESCRIPTOR: u16 = 5;
@@ -60,18 +274,8 @@ struct NodeDescriptor {
     allocation_descriptors_length: usize,
 }
 
-type WalkEntry = (String, bool, u64, Option<u64>);
-
-struct RangeReadState {
-    offset: u64,
-    wanted: usize,
-    logical_pos: u64,
-    out: Vec<u8>,
-}
-
-pub(crate) struct UdfIso {
+pub struct UdfIso {
     file: Mutex<File>,
-    path: PathBuf,
     block_size: u32,
     partition_start: u32,
     root_icb: LongAllocationDescriptor,
@@ -79,7 +283,7 @@ pub(crate) struct UdfIso {
 }
 
 impl UdfIso {
-    pub(crate) fn open(path: &Path) -> Result<Self, io::Error> {
+    pub fn open(path: &Path) -> Result<Self, IsoError> {
         let mut file = File::open(path)?;
         let vds_extent = read_anchor_vds_extent(&mut file)?;
         let (block_size, partition_start, file_set_icb, volume_label) =
@@ -88,7 +292,6 @@ impl UdfIso {
 
         Ok(Self {
             file: Mutex::new(file),
-            path: path.to_path_buf(),
             block_size,
             partition_start,
             root_icb,
@@ -96,37 +299,7 @@ impl UdfIso {
         })
     }
 
-    pub(crate) fn volume_label(&self) -> Option<&str> {
-        self.volume_label.as_deref()
-    }
-
-    pub(crate) fn read_file_range(
-        &self,
-        path: &str,
-        offset: u64,
-        length: usize,
-    ) -> Result<Vec<u8>, ProfileError> {
-        let Some(entry) = self.resolve_path(path)? else {
-            return Err(ProfileError::MissingFile {
-                path: path.to_string(),
-            });
-        };
-        if entry.is_directory {
-            return Err(ProfileError::MissingFile {
-                path: path.to_string(),
-            });
-        }
-
-        let descriptor = self.read_node_descriptor(entry.icb)?;
-        if descriptor.file_type != FILE_TYPE_REGULAR {
-            return Err(ProfileError::MissingFile {
-                path: path.to_string(),
-            });
-        }
-        self.read_node_data_range(entry.icb, descriptor, offset, length)
-    }
-
-    fn resolve_path(&self, path: &str) -> Result<Option<DirEntry>, ProfileError> {
+    fn resolve_path(&self, path: &str) -> Result<Option<DirEntry>, IsoError> {
         let normalized = normalize_path(path);
         if normalized == "/" {
             return Ok(Some(DirEntry {
@@ -145,6 +318,9 @@ impl UdfIso {
         };
 
         for segment in normalized.trim_start_matches('/').split('/') {
+            if segment.is_empty() {
+                continue;
+            }
             if !current.is_directory {
                 return Ok(None);
             }
@@ -170,7 +346,7 @@ impl UdfIso {
         dir_path: &str,
         prefix_lower: &str,
         out: &mut Vec<String>,
-    ) -> Result<(), ProfileError> {
+    ) -> Result<(), IsoError> {
         for entry in self.read_directory_entries(dir_icb, dir_path)? {
             if entry.is_directory {
                 self.walk_files(entry.icb, &entry.path, prefix_lower, out)?;
@@ -182,98 +358,47 @@ impl UdfIso {
         Ok(())
     }
 
-    /// Walk every entry (files and directories) and return (path, is_dir, size).
-    pub(crate) fn walk_all_entries(&self) -> Result<Vec<WalkEntry>, ProfileError> {
-        let mut out = Vec::new();
-        self.walk_all_recursive(self.root_icb, "/", &mut out)?;
-        Ok(out)
-    }
-
-    fn walk_all_recursive(
-        &self,
-        dir_icb: LongAllocationDescriptor,
-        dir_path: &str,
-        out: &mut Vec<WalkEntry>,
-    ) -> Result<(), ProfileError> {
-        for entry in self.read_directory_entries(dir_icb, dir_path)? {
-            if entry.is_directory {
-                out.push((entry.path.clone(), true, 0, None));
-                self.walk_all_recursive(entry.icb, &entry.path, out)?;
-            } else {
-                let (size, iso_offset) = self.read_node_size_and_offset(entry.icb)?;
-                out.push((entry.path, false, size, iso_offset));
-            }
-        }
-        Ok(())
-    }
-
-    // Reads the file entry block once and returns both the file size and the
-    // byte offset of the first extent. Assumes contiguous layout, which holds
-    // for all mastered ISO images.
-    fn read_node_size_and_offset(
-        &self,
-        icb: LongAllocationDescriptor,
-    ) -> Result<(u64, Option<u64>), ProfileError> {
-        let mut file = self.file.lock().map_err(lock_error)?;
-        let offset = self.block_offset(icb.logical_block_num);
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|err| source_error(self.path.clone(), err))?;
-        let mut block = vec![0u8; self.block_size as usize];
-        file.read_exact(&mut block)
-            .map_err(|err| source_error(self.path.clone(), err))?;
-        let descriptor =
-            parse_node_descriptor(&block).map_err(|err| source_error(self.path.clone(), err))?;
-        let iso_offset =
-            first_extent_byte_offset(&block, &descriptor, self.partition_start, self.block_size);
-        Ok((descriptor.information_length, iso_offset))
-    }
-
     fn read_directory_entries(
         &self,
         dir_icb: LongAllocationDescriptor,
         dir_path: &str,
-    ) -> Result<Vec<DirEntry>, ProfileError> {
+    ) -> Result<Vec<DirEntry>, IsoError> {
         let descriptor = self.read_node_descriptor(dir_icb)?;
         if descriptor.file_type != FILE_TYPE_DIRECTORY {
-            return Err(source_error(
-                self.path.clone(),
-                io::Error::new(io::ErrorKind::InvalidData, "UDF node is not a directory"),
+            return Err(IsoError::InvalidData(
+                "UDF node is not a directory".to_string(),
             ));
         }
 
         let data = self.read_node_data(dir_icb, descriptor)?;
-        parse_directory_entries(&data, dir_path).map_err(|err| source_error(self.path.clone(), err))
+        parse_directory_entries(&data, dir_path).map_err(IsoError::Io)
     }
 
     fn read_node_descriptor(
         &self,
         icb: LongAllocationDescriptor,
-    ) -> Result<NodeDescriptor, ProfileError> {
-        let mut file = self.file.lock().map_err(lock_error)?;
+    ) -> Result<NodeDescriptor, IsoError> {
+        let mut file = self.file.lock().unwrap();
         let offset = self.block_offset(icb.logical_block_num);
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|err| source_error(self.path.clone(), err))?;
+        file.seek(SeekFrom::Start(offset))?;
 
         let mut block = vec![0u8; self.block_size as usize];
-        file.read_exact(&mut block)
-            .map_err(|err| source_error(self.path.clone(), err))?;
+        file.read_exact(&mut block)?;
 
-        parse_node_descriptor(&block).map_err(|err| source_error(self.path.clone(), err))
+        parse_node_descriptor(&block).map_err(IsoError::Io)
     }
 
     fn read_node_data(
         &self,
         icb: LongAllocationDescriptor,
         descriptor: NodeDescriptor,
-    ) -> Result<Vec<u8>, ProfileError> {
-        let mut file = self.file.lock().map_err(lock_error)?;
+    ) -> Result<Vec<u8>, IsoError> {
+        let mut file = self.file.lock().unwrap();
         let offset = self.block_offset(icb.logical_block_num);
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|err| source_error(self.path.clone(), err))?;
+        file.seek(SeekFrom::Start(offset))?;
 
         let mut block = vec![0u8; self.block_size as usize];
-        file.read_exact(&mut block)
-            .map_err(|err| source_error(self.path.clone(), err))?;
+        file.read_exact(&mut block)?;
 
         let data = block
             .get(
@@ -282,13 +407,7 @@ impl UdfIso {
                         + descriptor.allocation_descriptors_length,
             )
             .ok_or_else(|| {
-                source_error(
-                    self.path.clone(),
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "UDF allocation descriptors exceed node size",
-                    ),
-                )
+                IsoError::InvalidData("UDF allocation descriptors exceed node size".to_string())
             })?;
 
         match descriptor.allocation_type {
@@ -303,75 +422,9 @@ impl UdfIso {
             ALLOCATION_LONG => {
                 self.read_long_extents(&mut file, data, descriptor.information_length)
             }
-            other => Err(source_error(
-                self.path.clone(),
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported UDF allocation type: {other}"),
-                ),
-            )),
-        }
-    }
-
-    fn read_node_data_range(
-        &self,
-        icb: LongAllocationDescriptor,
-        descriptor: NodeDescriptor,
-        offset: u64,
-        length: usize,
-    ) -> Result<Vec<u8>, ProfileError> {
-        if offset > descriptor.information_length {
-            return Err(source_error(
-                self.path.clone(),
-                io::Error::new(io::ErrorKind::UnexpectedEof, "UDF range starts past EOF"),
-            ));
-        }
-        let available = descriptor.information_length - offset;
-        let wanted = length.min(available as usize);
-        if wanted == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut file = self.file.lock().map_err(lock_error)?;
-        let node_offset = self.block_offset(icb.logical_block_num);
-        file.seek(SeekFrom::Start(node_offset))
-            .map_err(|err| source_error(self.path.clone(), err))?;
-
-        let mut block = vec![0u8; self.block_size as usize];
-        file.read_exact(&mut block)
-            .map_err(|err| source_error(self.path.clone(), err))?;
-
-        let data = block
-            .get(
-                descriptor.allocation_descriptors_offset
-                    ..descriptor.allocation_descriptors_offset
-                        + descriptor.allocation_descriptors_length,
-            )
-            .ok_or_else(|| {
-                source_error(
-                    self.path.clone(),
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "UDF allocation descriptors exceed node size",
-                    ),
-                )
-            })?;
-
-        match descriptor.allocation_type {
-            ALLOCATION_EMBEDDED => {
-                let start = offset as usize;
-                let end = start.saturating_add(wanted).min(data.len());
-                Ok(data[start..end].to_vec())
-            }
-            ALLOCATION_SHORT => self.read_short_extents_range(&mut file, data, offset, wanted),
-            ALLOCATION_LONG => self.read_long_extents_range(&mut file, data, offset, wanted),
-            other => Err(source_error(
-                self.path.clone(),
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported UDF allocation type: {other}"),
-                ),
-            )),
+            other => Err(IsoError::InvalidData(format!(
+                "unsupported UDF allocation type: {other}"
+            ))),
         }
     }
 
@@ -380,17 +433,16 @@ impl UdfIso {
         file: &mut File,
         descriptors: &[u8],
         total_length: u64,
-    ) -> Result<Vec<u8>, ProfileError> {
+    ) -> Result<Vec<u8>, IsoError> {
         let mut out = Vec::new();
         for chunk in descriptors.chunks_exact(8) {
-            let extent_length =
-                le_u32(chunk, 0).map_err(|err| source_error(self.path.clone(), err))?;
+            let extent_length = le_u32(chunk, 0).map_err(IsoError::Io)?;
             if extent_length == 0 {
                 break;
             }
 
             let length = (extent_length & 0x3FFF_FFFF) as usize;
-            let block_num = le_u32(chunk, 4).map_err(|err| source_error(self.path.clone(), err))?;
+            let block_num = le_u32(chunk, 4).map_err(IsoError::Io)?;
             out.extend(self.read_extent(file, block_num, length)?);
             if out.len() >= total_length as usize {
                 break;
@@ -406,24 +458,18 @@ impl UdfIso {
         file: &mut File,
         descriptors: &[u8],
         total_length: u64,
-    ) -> Result<Vec<u8>, ProfileError> {
+    ) -> Result<Vec<u8>, IsoError> {
         let mut out = Vec::new();
         for chunk in descriptors.chunks_exact(16) {
-            let ad = parse_long_ad(chunk).map_err(|err| source_error(self.path.clone(), err))?;
+            let ad = parse_long_ad(chunk).map_err(IsoError::Io)?;
             if ad.length() == 0 {
                 break;
             }
             if ad.partition_ref_num != 0 {
-                return Err(source_error(
-                    self.path.clone(),
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported UDF partition reference: {}",
-                            ad.partition_ref_num
-                        ),
-                    ),
-                ));
+                return Err(IsoError::InvalidData(format!(
+                    "unsupported UDF partition reference: {}",
+                    ad.partition_ref_num
+                )));
             }
 
             out.extend(self.read_extent(file, ad.logical_block_num, ad.length())?);
@@ -436,123 +482,17 @@ impl UdfIso {
         Ok(out)
     }
 
-    fn read_short_extents_range(
-        &self,
-        file: &mut File,
-        descriptors: &[u8],
-        offset: u64,
-        wanted: usize,
-    ) -> Result<Vec<u8>, ProfileError> {
-        let mut state = RangeReadState {
-            offset,
-            wanted,
-            logical_pos: 0,
-            out: Vec::with_capacity(wanted),
-        };
-        for chunk in descriptors.chunks_exact(8) {
-            let extent_length =
-                le_u32(chunk, 0).map_err(|err| source_error(self.path.clone(), err))?;
-            if extent_length == 0 {
-                break;
-            }
-
-            let length = u64::from(extent_length & 0x3FFF_FFFF);
-            let block_num = le_u32(chunk, 4).map_err(|err| source_error(self.path.clone(), err))?;
-            self.read_extent_range(file, block_num, length, &mut state)?;
-            if state.out.len() >= wanted {
-                break;
-            }
-        }
-        Ok(state.out)
-    }
-
-    fn read_long_extents_range(
-        &self,
-        file: &mut File,
-        descriptors: &[u8],
-        offset: u64,
-        wanted: usize,
-    ) -> Result<Vec<u8>, ProfileError> {
-        let mut state = RangeReadState {
-            offset,
-            wanted,
-            logical_pos: 0,
-            out: Vec::with_capacity(wanted),
-        };
-        for chunk in descriptors.chunks_exact(16) {
-            let ad = parse_long_ad(chunk).map_err(|err| source_error(self.path.clone(), err))?;
-            let length = ad.length() as u64;
-            if length == 0 {
-                break;
-            }
-            if ad.partition_ref_num != 0 {
-                return Err(source_error(
-                    self.path.clone(),
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported UDF partition reference: {}",
-                            ad.partition_ref_num
-                        ),
-                    ),
-                ));
-            }
-
-            self.read_extent_range(file, ad.logical_block_num, length, &mut state)?;
-            if state.out.len() >= wanted {
-                break;
-            }
-        }
-        Ok(state.out)
-    }
-
-    fn read_extent_range(
-        &self,
-        file: &mut File,
-        block_num: u32,
-        extent_length: u64,
-        state: &mut RangeReadState,
-    ) -> Result<(), ProfileError> {
-        let extent_start = state.logical_pos;
-        let extent_end = extent_start.saturating_add(extent_length);
-        state.logical_pos = extent_end;
-
-        if extent_end <= state.offset || state.out.len() >= state.wanted {
-            return Ok(());
-        }
-
-        let in_extent_start = state.offset.saturating_sub(extent_start);
-        let remaining = state.wanted - state.out.len();
-        let available = extent_length.saturating_sub(in_extent_start);
-        let to_read = remaining.min(available as usize);
-        if to_read == 0 {
-            return Ok(());
-        }
-
-        let read_offset = self.block_offset(block_num).saturating_add(in_extent_start);
-        file.seek(SeekFrom::Start(read_offset))
-            .map_err(|err| source_error(self.path.clone(), err))?;
-
-        let start_len = state.out.len();
-        state.out.resize(start_len + to_read, 0);
-        file.read_exact(&mut state.out[start_len..])
-            .map_err(|err| source_error(self.path.clone(), err))?;
-        Ok(())
-    }
-
     fn read_extent(
         &self,
         file: &mut File,
         block_num: u32,
         length: usize,
-    ) -> Result<Vec<u8>, ProfileError> {
+    ) -> Result<Vec<u8>, IsoError> {
         let offset = self.block_offset(block_num);
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|err| source_error(self.path.clone(), err))?;
+        file.seek(SeekFrom::Start(offset))?;
 
         let mut bytes = vec![0u8; length];
-        file.read_exact(&mut bytes)
-            .map_err(|err| source_error(self.path.clone(), err))?;
+        file.read_exact(&mut bytes)?;
         Ok(bytes)
     }
 
@@ -562,7 +502,7 @@ impl UdfIso {
 }
 
 impl SourceFs for UdfIso {
-    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, ProfileError> {
+    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, IsoError> {
         let Some(entry) = self.resolve_path(path)? else {
             return Ok(None);
         };
@@ -578,11 +518,11 @@ impl SourceFs for UdfIso {
         self.read_node_data(entry.icb, descriptor).map(Some)
     }
 
-    fn path_exists(&self, path: &str) -> Result<bool, ProfileError> {
+    fn path_exists(&self, path: &str) -> Result<bool, IsoError> {
         Ok(self.resolve_path(path)?.is_some())
     }
 
-    fn list_files(&self, prefix: &str) -> Result<Vec<String>, ProfileError> {
+    fn list_files(&self, prefix: &str) -> Result<Vec<String>, IsoError> {
         let mut out = Vec::new();
         let prefix = normalize_path(prefix).to_ascii_lowercase();
         self.walk_files(self.root_icb, "/", &prefix, &mut out)?;
@@ -590,7 +530,7 @@ impl SourceFs for UdfIso {
         Ok(out)
     }
 
-    fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, ProfileError> {
+    fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, IsoError> {
         let Some(entry) = self.resolve_path(dir_path)? else {
             return Ok(Vec::new());
         };
@@ -603,13 +543,19 @@ impl SourceFs for UdfIso {
         Ok(result)
     }
 
-    fn file_slice(&self, _path: &str) -> Result<Option<IsoSlice>, ProfileError> {
+    fn file_slice(&self, _path: &str) -> Result<Option<IsoSlice>, IsoError> {
+        // LongAllocationDescriptor doesn't easily translate to a single contiguous byte slice
+        // since UDF files can be fragmented. For simplicity in detection, we return None.
         Ok(None)
+    }
+
+    fn volume_label(&self) -> Option<String> {
+        self.volume_label.clone()
     }
 }
 
 fn read_anchor_vds_extent(file: &mut File) -> Result<(u32, u32), io::Error> {
-    let anchor = read_sector(file, DEFAULT_AVDP_SECTOR, 2048)?;
+    let anchor = read_sector(file, 256, 2048)?;
     if le_u16(&anchor, 0)? != TAG_ANCHOR_VOLUME_DESCRIPTOR_POINTER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -695,43 +641,6 @@ fn read_root_icb(
     parse_long_ad(&descriptor[400..416])
 }
 
-fn first_extent_byte_offset(
-    block: &[u8],
-    descriptor: &NodeDescriptor,
-    partition_start: u32,
-    block_size: u32,
-) -> Option<u64> {
-    let alloc_data = block.get(
-        descriptor.allocation_descriptors_offset
-            ..descriptor.allocation_descriptors_offset + descriptor.allocation_descriptors_length,
-    )?;
-    match descriptor.allocation_type {
-        ALLOCATION_SHORT => {
-            if alloc_data.len() < 8 {
-                return None;
-            }
-            let extent_length = le_u32(alloc_data, 0).ok()? & 0x3FFF_FFFF;
-            if extent_length == 0 {
-                return None;
-            }
-            let block_num = le_u32(alloc_data, 4).ok()?;
-            Some(u64::from(partition_start + block_num) * u64::from(block_size))
-        }
-        ALLOCATION_LONG => {
-            if alloc_data.len() < 16 {
-                return None;
-            }
-            let extent_length = le_u32(alloc_data, 0).ok()? & 0x3FFF_FFFF;
-            if extent_length == 0 {
-                return None;
-            }
-            let lbn = le_u32(alloc_data, 4).ok()?;
-            Some(u64::from(partition_start + lbn) * u64::from(block_size))
-        }
-        _ => None,
-    }
-}
-
 fn parse_node_descriptor(block: &[u8]) -> io::Result<NodeDescriptor> {
     let tag = le_u16(block, 0)?;
     let file_type = *block.get(27).ok_or_else(|| {
@@ -795,7 +704,7 @@ fn parse_directory_entries(data: &[u8], dir_path: &str) -> io::Result<Vec<DirEnt
             let path = if dir_path == "/" {
                 format!("/{}", name)
             } else {
-                format!("{dir_path}/{}", name)
+                format!("{}/{}", dir_path.trim_end_matches('/'), name)
             };
             entries.push(DirEntry {
                 name,
@@ -891,30 +800,16 @@ fn le_u64(bytes: &[u8], offset: usize) -> io::Result<u64> {
     ]))
 }
 
-fn lock_error(_: std::sync::PoisonError<std::sync::MutexGuard<'_, File>>) -> ProfileError {
-    source_error(
-        PathBuf::from("<udf>"),
-        io::Error::other("UDF file lock poisoned"),
-    )
-}
-
-fn source_error(path: PathBuf, err: io::Error) -> ProfileError {
-    ProfileError::SourceUnreadable(path, err)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decodes_udf_dstring() {
-        let bytes = [8, b'T', b'E', b'S', b'T', 4];
-        assert_eq!(decode_dstring(&bytes), "TEST");
-    }
-
-    #[test]
-    fn decodes_udf_filename() {
-        let bytes = [8, b'b', b'o', b'o', b't'];
-        assert_eq!(decode_filename(&bytes), "boot");
+    fn test_normalize_path() {
+        assert_eq!(normalize_path("foo"), "/foo");
+        assert_eq!(normalize_path("/foo/"), "/foo");
+        assert_eq!(normalize_path("\\foo\\bar"), "/foo/bar");
+        assert_eq!(normalize_path(""), "/");
+        assert_eq!(normalize_path("/"), "/");
     }
 }
