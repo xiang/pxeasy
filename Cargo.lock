@@ -3033,6 +3033,7 @@ dependencies = [
  "fatfs",
  "fscommon",
  "gpt",
+ "log",
  "pxe-ufs",
  "tempfile",
  "uuid",

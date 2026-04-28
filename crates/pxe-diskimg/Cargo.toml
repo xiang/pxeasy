@@ -9,6 +9,7 @@ fatfs = "0.3"
 anyhow = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 fscommon = "0.1"
+log = "0.4"
 pxe-ufs = { path = "../pxe-ufs" }
 
 [dev-dependencies]
