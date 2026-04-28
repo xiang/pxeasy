@@ -1,12 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet},
-    io::{self, Read},
+    collections::HashMap,
+    io,
     path::{Path, PathBuf},
 };
 
-use flate2::read::GzDecoder;
 pub use pxe_iso::{normalize_path, CdfsIso, IsoError, IsoSlice, SourceFs, UdfIso};
-use tar::Archive;
 
 pub use error::ProfileError;
 mod error;
@@ -46,7 +44,6 @@ pub enum Platform {
 pub enum BootSourceKind {
     UbuntuLiveIso,
     DebianInstallerIso,
-    DebianNetboot,
     FreeBSDBootOnly,
     WindowsIso,
     Unknown,
@@ -160,34 +157,16 @@ pub fn detect_profile(source_path: &Path) -> Result<BootProfile, ProfileError> {
         return Ok(BootProfile::Linux(profile));
     }
 
-    if is_tar_gz(source_path) {
-        detect_from_tar_gz(source_path)
-    } else {
-        detect_from_iso(source_path)
-    }
+    detect_from_iso(source_path)
 }
 
 /// Load a file from the detected boot source.
 pub fn load_file(source_path: &Path, file_path: &str) -> Result<Vec<u8>, ProfileError> {
-    if is_tar_gz(source_path) {
-        load_file_from_tar_gz(source_path, file_path)
-    } else {
-        load_file_from_iso(source_path, file_path)
-    }
+    load_file_from_iso(source_path, file_path)
 }
 
 /// Return the byte offset and length of a file inside an ISO image.
 pub fn load_file_slice(source_path: &Path, file_path: &str) -> Result<IsoSlice, ProfileError> {
-    if is_tar_gz(source_path) {
-        return Err(ProfileError::SourceUnreadable(
-            source_path.to_path_buf(),
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("file slices are only supported for ISO sources: {file_path}"),
-            ),
-        ));
-    }
-
     load_file_slice_from_iso(source_path, file_path)
 }
 
@@ -198,11 +177,6 @@ pub fn load_file_range(
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, ProfileError> {
-    if is_tar_gz(source_path) {
-        let bytes = load_file_from_tar_gz(source_path, file_path)?;
-        return slice_loaded_file(file_path, &bytes, offset, length);
-    }
-
     let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
         Ok(source) => Box::new(source),
         Err(_) => Box::new(CdfsIso::open(source_path)?),
@@ -224,29 +198,19 @@ pub fn load_file_range(
 
 /// List all files in the detected boot source that start with `prefix`.
 pub fn list_dir(source_path: &Path, dir_path: &str) -> Result<Vec<(String, bool)>, ProfileError> {
-    if is_tar_gz(source_path) {
-        let source = load_tar_gz_source(source_path)?;
-        Ok(source.list_dir(dir_path)?)
-    } else {
-        let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
-            Ok(source) => Box::new(source),
-            Err(_) => Box::new(CdfsIso::open(source_path)?),
-        };
-        Ok(source.list_dir(dir_path)?)
-    }
+    let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
+        Ok(source) => Box::new(source),
+        Err(_) => Box::new(CdfsIso::open(source_path)?),
+    };
+    Ok(source.list_dir(dir_path)?)
 }
 
 pub fn list_files(source_path: &Path, prefix: &str) -> Result<Vec<String>, ProfileError> {
-    if is_tar_gz(source_path) {
-        let source = load_tar_gz_source(source_path)?;
-        Ok(source.list_files(prefix)?)
-    } else {
-        let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
-            Ok(source) => Box::new(source),
-            Err(_) => Box::new(CdfsIso::open(source_path)?),
-        };
-        Ok(source.list_files(prefix)?)
-    }
+    let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
+        Ok(source) => Box::new(source),
+        Err(_) => Box::new(CdfsIso::open(source_path)?),
+    };
+    Ok(source.list_files(prefix)?)
 }
 
 pub fn build_metadata_map(
@@ -288,31 +252,31 @@ pub fn build_metadata_map(
 }
 
 pub fn load_all_files(source_path: &Path) -> Result<HashMap<String, Vec<u8>>, ProfileError> {
-    if is_tar_gz(source_path) {
-        let source = load_tar_gz_source(source_path)?;
-        Ok(source.files)
-    } else {
-        let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
-            Ok(source) => Box::new(source),
-            Err(_) => Box::new(CdfsIso::open(source_path)?),
-        };
+    let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
+        Ok(source) => Box::new(source),
+        Err(_) => Box::new(CdfsIso::open(source_path)?),
+    };
 
-        let mut out = HashMap::new();
-        let paths = source.list_files("/")?;
-        for path in paths {
-            if let Ok(Some(content)) = source.read_file(&path) {
-                out.insert(path, content);
-            }
+    let mut out = HashMap::new();
+    let paths = source.list_files("/")?;
+    for path in paths {
+        if let Ok(Some(content)) = source.read_file(&path) {
+            out.insert(path, content);
         }
-        Ok(out)
     }
+    Ok(out)
 }
 
+#[cfg(test)]
+use std::collections::HashSet;
+
+#[cfg(test)]
 struct MemorySourceFs {
     files: HashMap<String, Vec<u8>>,
     dirs: HashSet<String>,
 }
 
+#[cfg(test)]
 impl MemorySourceFs {
     fn new() -> Self {
         Self {
@@ -321,13 +285,11 @@ impl MemorySourceFs {
         }
     }
 
-    #[cfg(test)]
     fn with_dir(mut self, path: &str) -> Self {
         self.insert_dir(path);
         self
     }
 
-    #[cfg(test)]
     fn with_file(mut self, path: &str, content: &[u8]) -> Self {
         self.insert_file(path, content.to_vec());
         self
@@ -352,6 +314,7 @@ impl MemorySourceFs {
     }
 }
 
+#[cfg(test)]
 impl SourceFs for MemorySourceFs {
     fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, IsoError> {
         Ok(self.files.get(&normalize_path(path)).cloned())
@@ -452,85 +415,6 @@ fn load_file_slice_from_iso(source_path: &Path, file_path: &str) -> Result<IsoSl
         })
 }
 
-fn slice_loaded_file(
-    file_path: &str,
-    bytes: &[u8],
-    offset: u64,
-    length: usize,
-) -> Result<Vec<u8>, ProfileError> {
-    let start = usize::try_from(offset).map_err(|_| ProfileError::MissingFile {
-        path: file_path.to_string(),
-    })?;
-    if start > bytes.len() {
-        return Err(ProfileError::MissingFile {
-            path: file_path.to_string(),
-        });
-    }
-    let end = start.saturating_add(length).min(bytes.len());
-    Ok(bytes[start..end].to_vec())
-}
-
-fn detect_from_tar_gz(source_path: &Path) -> Result<BootProfile, ProfileError> {
-    let source = load_tar_gz_source(source_path)?;
-    let filename = source_path.file_name().and_then(|n| n.to_str());
-    detect_from_source(&source, filename, None)
-}
-
-fn load_file_from_tar_gz(source_path: &Path, file_path: &str) -> Result<Vec<u8>, ProfileError> {
-    load_tar_gz_source(source_path)?
-        .read_file(file_path)?
-        .ok_or_else(|| ProfileError::MissingFile {
-            path: file_path.to_string(),
-        })
-}
-
-fn load_tar_gz_source(source_path: &Path) -> Result<MemorySourceFs, ProfileError> {
-    let file = std::fs::File::open(source_path)
-        .map_err(|e| ProfileError::SourceUnreadable(source_path.to_path_buf(), e))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
-    let mut source = MemorySourceFs::new();
-    let entries = archive.entries().map_err(|e| {
-        ProfileError::SourceUnreadable(
-            source_path.to_path_buf(),
-            io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-        )
-    })?;
-
-    for entry_result in entries {
-        let mut entry = entry_result.map_err(|e| {
-            ProfileError::SourceUnreadable(
-                source_path.to_path_buf(),
-                io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-            )
-        })?;
-        let path = entry.path().map_err(|e| {
-            ProfileError::SourceUnreadable(
-                source_path.to_path_buf(),
-                io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
-            )
-        })?;
-        let normalized = normalize_path(path.to_string_lossy().as_ref());
-
-        if entry.header().entry_type().is_dir() {
-            source.insert_dir(&normalized);
-            continue;
-        }
-
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-
-        let mut contents = Vec::new();
-        entry
-            .read_to_end(&mut contents)
-            .map_err(|e| ProfileError::SourceUnreadable(source_path.to_path_buf(), e))?;
-        source.insert_file(&normalized, contents);
-    }
-
-    Ok(source)
-}
-
 fn detect_from_source(
     source: &dyn SourceFs,
     filename: Option<&str>,
@@ -629,50 +513,6 @@ fn detect_from_source(
         }));
     }
 
-    for arch in ["amd64", "arm64"] {
-        let kernel_path = format!("/debian-installer/{arch}/linux");
-        let initrd_path = format!("/debian-installer/{arch}/initrd.gz");
-
-        if source.path_exists(&kernel_path)? || source.path_exists(&initrd_path)? {
-            for path in [&kernel_path, &initrd_path] {
-                if !source.path_exists(path)? {
-                    return Err(ProfileError::MissingFile { path: path.clone() });
-                }
-            }
-
-            let efi_path = select_first_existing_path(
-                source,
-                &[
-                    &format!("/debian-installer/{arch}/bootnetaa64.efi"),
-                    &format!("/debian-installer/{arch}/grubaa64.efi"),
-                    &format!("/debian-installer/{arch}/bootnetx64.efi"),
-                    &format!("/debian-installer/{arch}/grubx64.efi"),
-                    "/EFI/BOOT/BOOTX64.EFI",
-                    "/EFI/BOOT/BOOTAA64.EFI",
-                    "/EFI/BOOT/shimx64.efi",
-                    "/EFI/BOOT/shimaa64.efi",
-                    "/EFI/BOOT/grubx64.efi",
-                    "/EFI/BOOT/grubaa64.efi",
-                ],
-            )?;
-
-            return Ok(BootProfile::Linux(LinuxProfile {
-                platform: Platform::Debian,
-                source_kind: BootSourceKind::DebianNetboot,
-                architecture: match arch {
-                    "amd64" => Architecture::Amd64,
-                    "arm64" => Architecture::Arm64,
-                    _ => return Err(ProfileError::UnknownDistro),
-                },
-                efi_path,
-                label: format!("Debian Netboot ({arch})"),
-                kernel_path,
-                initrd_path,
-                boot_params: String::new(),
-            }));
-        }
-    }
-
     Err(ProfileError::UnknownDistro)
 }
 
@@ -761,12 +601,6 @@ pub(crate) fn architecture_from_path(path: &str) -> Option<Architecture> {
     } else {
         None
     }
-}
-
-fn is_tar_gz(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".tar.gz") || name.ends_with(".tgz"))
 }
 
 // ---------------------------------------------------------------------------
@@ -903,32 +737,6 @@ mod tests {
 
     // --- Netboot archive detection ---
 
-    #[test]
-    fn debian_netboot_detected_from_installer_tree() {
-        let source = MockSource::new()
-            .with_dir("/debian-installer/arm64")
-            .with_file("/debian-installer/arm64/linux", b"")
-            .with_file("/debian-installer/arm64/initrd.gz", b"")
-            .with_file("/debian-installer/arm64/grubaa64.efi", b"");
-
-        let profile = detect_from_source(&source, None, None).unwrap();
-        let BootProfile::Linux(profile) = &profile else {
-            panic!("expected BootProfile::Linux");
-        };
-        assert_eq!(profile.platform, Platform::Debian);
-        assert_eq!(profile.source_kind, BootSourceKind::DebianNetboot);
-        assert_eq!(profile.architecture, Architecture::Arm64);
-        let (kp, ip, bp) = linux_source(profile);
-        assert_eq!(kp, "/debian-installer/arm64/linux");
-        assert_eq!(ip, "/debian-installer/arm64/initrd.gz");
-        assert_eq!(
-            profile.efi_path,
-            Some("/debian-installer/arm64/grubaa64.efi".to_string())
-        );
-        assert_eq!(profile.label, "Debian Netboot (arm64)");
-        assert!(bp.is_empty());
-    }
-
     // --- UnknownDistro ---
 
     #[test]
@@ -983,23 +791,6 @@ mod tests {
             panic!("expected BootProfile::Linux");
         };
         assert_eq!(profile.architecture, Architecture::Arm64);
-    }
-
-    #[test]
-    fn ubuntu_netboot_tarball_is_rejected() {
-        let iso = MockSource::new()
-            .with_dir("/arm64")
-            .with_dir("/arm64/grub")
-            .with_file("/arm64/linux", b"")
-            .with_file("/arm64/initrd", b"")
-            .with_file("/arm64/bootaa64.efi", b"")
-            .with_file(
-                "/arm64/grub/grub.cfg",
-                b"menuentry \"Install Ubuntu Server\" {\n linux linux iso-url=http://example.invalid/ubuntu.iso ip=dhcp ---\n initrd initrd\n}\n",
-            );
-
-        let err = detect_from_source(&iso, None, None).unwrap_err();
-        assert!(matches!(err, ProfileError::UnknownDistro));
     }
 
     // --- FreeBSD detection ---
