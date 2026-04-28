@@ -6,30 +6,16 @@ use std::{
 };
 
 use cdfs::{DirectoryEntry, ExtraAttributes, ISO9660};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum IsoError {
-    Io(io::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    #[error("Invalid data: {0}")]
     InvalidData(String),
+    #[error("Not found: {0}")]
     NotFound(String),
-}
-
-impl std::fmt::Display for IsoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IsoError::Io(e) => write!(f, "IO error: {}", e),
-            IsoError::InvalidData(s) => write!(f, "Invalid data: {}", s),
-            IsoError::NotFound(s) => write!(f, "Not found: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for IsoError {}
-
-impl From<io::Error> for IsoError {
-    fn from(err: io::Error) -> Self {
-        IsoError::Io(err)
-    }
 }
 
 pub struct IsoSlice {

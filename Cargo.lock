@@ -3061,6 +3061,7 @@ dependencies = [
  "anyhow",
  "cdfs",
  "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
