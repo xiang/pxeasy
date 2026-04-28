@@ -20,7 +20,6 @@ pub enum ArchitectureSummary {
 pub enum SourceKindSummary {
     UbuntuLiveIso,
     DebianInstallerIso,
-    DebianNetboot,
     FreeBSDBootOnly,
     WindowsIso,
     Unknown,
@@ -93,7 +92,6 @@ impl AppController {
                 pxeasy_runtime::BootSourceKind::DebianInstallerIso => {
                     SourceKindSummary::DebianInstallerIso
                 }
-                pxeasy_runtime::BootSourceKind::DebianNetboot => SourceKindSummary::DebianNetboot,
                 pxeasy_runtime::BootSourceKind::FreeBSDBootOnly => {
                     SourceKindSummary::FreeBSDBootOnly
                 }
