@@ -46,9 +46,11 @@ impl FsLayout {
             let fragsperinode = (density / fsize).max(1);
             let ipg = roundup(howmany(fpg as u64, fragsperinode as u64), inopb as u64) as u32;
 
-            // CGSIZE macro from fs.h
-            // sizeof(struct cg) + howmany(ipg, 8) + howmany(fpg, 8) + 4
-            let cg_size = 168 + howmany(ipg as u64, 8) + howmany(fpg as u64, 8) + 4;
+            // CGSIZE from FreeBSD fs.h with fs_contigsumsize=0:
+            // sizeof(cg)=168 + sizeof(i32)=4 + howmany(ipg,8) + howmany(fpg,8)
+            //   + contigsumsize*4=0 + (1+contigsumsize)*howmany(fpg,8) + sizeof(u32)=4
+            // = 176 + howmany(ipg,8) + 2*howmany(fpg,8)
+            let cg_size = 176 + howmany(ipg as u64, 8) + 2 * howmany(fpg as u64, 8);
             if cg_size <= bsize as u64 - 8 {
                 break (fpg, ipg);
             }
@@ -58,18 +60,22 @@ impl FsLayout {
             fpg -= frag;
         };
 
-        let ncg = howmany(total_frags as u64, fpg as u64) as u32;
+        let ncg = (total_frags / fpg as i64) as u32;
+        if ncg == 0 {
+            return Err("Image too small to hold filesystem metadata".into());
+        }
         let dblkno = iblkno + (ipg / (inopb / frag)) as i32;
 
         let cssize = roundup((ncg * 16) as u64, fsize as u64) as i32;
         let csaddr = dblkno as i64; // In the first CG's data area
 
+        let fs_size = ncg as i64 * fpg as i64;
         Ok(FsLayout {
             ncg,
             fpg,
             ipg,
-            fs_size: total_frags,
-            fs_dsize: total_frags - (ncg as i64 * dblkno as i64), // Rough estimate
+            fs_size,
+            fs_dsize: fs_size - (ncg as i64 * dblkno as i64),
             csaddr,
             cssize,
             sblkno,

@@ -1,9 +1,11 @@
 use crate::format::UFS_ROOTINO;
+use log::debug;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum EntryKind {
@@ -56,9 +58,21 @@ impl SourceTree {
         queue.push_back(0);
 
         let mut next_ino = UFS_ROOTINO + 1;
+        let mut last_log = Instant::now();
+        let start = Instant::now();
 
         while let Some(parent_idx) = queue.pop_front() {
             let parent_path = entries[parent_idx].path.clone();
+
+            if last_log.elapsed() >= Duration::from_secs(2) {
+                debug!(
+                    "UFS scan progress: {} entries found in {:.1}s",
+                    entries.len(),
+                    start.elapsed().as_secs_f32()
+                );
+                last_log = Instant::now();
+            }
+
             let parent_ino = entries[parent_idx].ino;
 
             let mut children_entries = Vec::new();

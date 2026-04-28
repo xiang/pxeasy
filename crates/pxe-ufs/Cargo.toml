@@ -6,7 +6,8 @@ authors = ["Gemini CLI"]
 description = "Write-only UFS2 filesystem image writer"
 
 [dependencies]
-# std only as per spec
+crc = "3.4"
+log = "0.4"
 
 [lib]
 path = "src/lib.rs"
