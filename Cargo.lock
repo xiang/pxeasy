@@ -3078,6 +3078,7 @@ dependencies = [
  "flate2",
  "pxe-iso",
  "tar",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3085,6 +3086,7 @@ name = "pxe-proto"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -7,3 +7,4 @@ edition = "2021"
 flate2 = "1"
 pxe-iso = { path = "../pxe-iso" }
 tar = "0.4"
+thiserror = "2"
