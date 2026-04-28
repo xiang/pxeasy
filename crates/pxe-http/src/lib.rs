@@ -76,6 +76,10 @@ impl HttpServer {
                         log::warn!("failed to set stream blocking: {}", err);
                         continue;
                     }
+                    if let Err(err) = stream.set_nodelay(true) {
+                        log::warn!("failed to set TCP_NODELAY: {}", err);
+                        continue;
+                    }
                     let assets = Arc::clone(&self.assets);
                     let handle = thread::spawn(move || {
                         if let Err(err) = handle_connection(stream, &assets) {
@@ -104,126 +108,176 @@ fn handle_connection(mut stream: TcpStream, assets: &HashMap<String, HttpAsset>)
         .peer_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
-    let mut buf = [0; 4096];
-    let mut request_data = Vec::new();
+
+    // After the last block read, loader.efi processes data and calls ExitBootServices.
+    // Open keep-alive connections during ExitBootServices can hang network teardown.
+    // Close idle connections after 5s so they're gone before ExitBootServices runs.
+    const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
     loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Ok(());
-        }
-        request_data.extend_from_slice(&buf[..n]);
-        if request_data.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if request_data.len() > 8192 {
-            return Ok(()); // Avoid arbitrary large headers memory exhaustion
-        }
-    }
-
-    let req_str = String::from_utf8_lossy(&request_data);
-    let mut lines = req_str.lines();
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
-
-    let head_only = method == "HEAD";
-    if method != "GET" && method != "HEAD" {
-        send_response(
-            &mut stream,
-            (405, "Method Not Allowed"),
-            "text/plain; charset=utf-8",
-            None,
-            18,
-            b"method not allowed",
-            head_only,
-        )?;
-        log::debug!("{} {} from {} -> 405", method, path, peer);
-        return Ok(());
-    }
-
-    if path == "/health" {
-        send_response(
-            &mut stream,
-            (200, "OK"),
-            "text/plain; charset=utf-8",
-            None,
-            3,
-            b"ok\n",
-            head_only,
-        )?;
-        log::trace!("{} {} from {} -> 200", method, path, peer);
-        return Ok(());
-    }
-
-    let mut range_header = None;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("range") {
-                range_header = Some(v.trim().to_string());
+        stream.set_read_timeout(Some(KEEP_ALIVE_IDLE_TIMEOUT))?;
+        let mut buf = [0; 4096];
+        let mut request_data = Vec::new();
+        loop {
+            let n = match stream.read(&mut buf) {
+                Ok(n) => n,
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            if n == 0 {
+                return Ok(()); // client closed connection
+            }
+            request_data.extend_from_slice(&buf[..n]);
+            if request_data.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if request_data.len() > 8192 {
+                return Ok(());
             }
         }
-    }
+        stream.set_read_timeout(None)?;
 
-    let level = if range_header.is_none() {
-        log::Level::Debug
-    } else {
-        log::Level::Trace
-    };
-    log::log!(
-        level,
-        "{} {} from {} range={:?}",
-        method,
-        path,
-        peer,
-        range_header
-    );
+        let req_str = String::from_utf8_lossy(&request_data);
+        let mut lines = req_str.lines();
+        let request_line = lines.next().unwrap_or("");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
 
-    let asset = match assets.get(path) {
-        Some(a) => a,
-        None => {
+        let head_only = method == "HEAD";
+        let mut range_header = None;
+        let mut keep_alive = true; // HTTP/1.1 default
+
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                let k = k.trim();
+                let v = v.trim();
+                if k.eq_ignore_ascii_case("range") {
+                    range_header = Some(v.to_string());
+                } else if k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close") {
+                    keep_alive = false;
+                }
+            }
+        }
+
+        if method != "GET" && method != "HEAD" {
             send_response(
                 &mut stream,
-                (404, "Not Found"),
-                "text/plain; charset=utf-8",
-                None,
-                9,
-                b"not found",
+                Response {
+                    status: (405, "Method Not Allowed"),
+                    content_type: "text/plain; charset=utf-8",
+                    content_range: None,
+                    content_length: 18,
+                    body: b"method not allowed",
+                },
+                keep_alive,
                 head_only,
             )?;
-            log::warn!("{} {} from {} -> 404", method, path, peer);
-            return Ok(());
+            log::debug!("{} {} from {} -> 405", method, path, peer);
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
         }
-    };
 
-    match serve_asset(&mut stream, path, asset, range_header.as_deref(), head_only) {
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
-            log::warn!("{} {} from {} -> 416 ({})", method, path, peer, err);
+        if path == "/health" {
             send_response(
                 &mut stream,
-                (416, "Range Not Satisfiable"),
-                "text/plain; charset=utf-8",
-                None,
-                21,
-                b"range not satisfiable",
+                Response {
+                    status: (200, "OK"),
+                    content_type: "text/plain; charset=utf-8",
+                    content_range: None,
+                    content_length: 3,
+                    body: b"ok\n",
+                },
+                keep_alive,
                 head_only,
-            )
+            )?;
+            log::trace!("{} {} from {} -> 200", method, path, peer);
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
         }
-        Err(err) => {
-            log::warn!("{} {} from {} -> 500 ({})", method, path, peer, err);
-            send_response(
-                &mut stream,
-                (500, "Internal Server Error"),
-                "text/plain; charset=utf-8",
-                None,
-                21,
-                b"internal server error",
-                head_only,
-            )
+
+        log::trace!("{} {} from {} range={:?}", method, path, peer, range_header);
+
+        let asset = match assets.get(path) {
+            Some(a) => a,
+            None => {
+                send_response(
+                    &mut stream,
+                    Response {
+                        status: (404, "Not Found"),
+                        content_type: "text/plain; charset=utf-8",
+                        content_range: None,
+                        content_length: 9,
+                        body: b"not found",
+                    },
+                    keep_alive,
+                    head_only,
+                )?;
+                log::warn!("{} {} from {} -> 404", method, path, peer);
+                if !keep_alive {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+
+        match serve_asset(
+            &mut stream,
+            path,
+            asset,
+            range_header.as_deref(),
+            keep_alive,
+            head_only,
+        ) {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
+                log::warn!("{} {} from {} -> 416 ({})", method, path, peer, err);
+                send_response(
+                    &mut stream,
+                    Response {
+                        status: (416, "Range Not Satisfiable"),
+                        content_type: "text/plain; charset=utf-8",
+                        content_range: None,
+                        content_length: 21,
+                        body: b"range not satisfiable",
+                    },
+                    keep_alive,
+                    head_only,
+                )?;
+            }
+            Err(err) => {
+                // May have partially written a response body — don't reuse this connection.
+                log::warn!("{} {} from {} -> 500 ({})", method, path, peer, err);
+                let _ = send_response(
+                    &mut stream,
+                    Response {
+                        status: (500, "Internal Server Error"),
+                        content_type: "text/plain; charset=utf-8",
+                        content_range: None,
+                        content_length: 21,
+                        body: b"internal server error",
+                    },
+                    false,
+                    head_only,
+                );
+                return Ok(());
+            }
+        }
+
+        if !keep_alive {
+            return Ok(());
         }
     }
 }
@@ -233,6 +287,7 @@ fn serve_asset(
     request_path: &str,
     asset: &HttpAsset,
     range_header: Option<&str>,
+    keep_alive: bool,
     head_only: bool,
 ) -> io::Result<()> {
     match asset {
@@ -252,13 +307,7 @@ fn serve_asset(
                 end.saturating_sub(start).saturating_add(1)
             };
             let range_hdr = range.map(|(s, e)| format!("bytes {}-{}/{}", s, e, full_len));
-            let level = if range_header.is_none() {
-                log::Level::Debug
-            } else {
-                log::Level::Trace
-            };
-            log::log!(
-                level,
+            log::trace!(
                 "serving memory {} len={} body_len={} range={:?} head_only={}",
                 request_path,
                 full_len,
@@ -273,11 +322,14 @@ fn serve_asset(
             };
             send_response(
                 stream,
-                (status_code, status_msg),
-                content_type,
-                range_hdr.as_deref(),
-                body_len,
-                &body,
+                Response {
+                    status: (status_code, status_msg),
+                    content_type,
+                    content_range: range_hdr.as_deref(),
+                    content_length: body_len,
+                    body: &body,
+                },
+                keep_alive,
                 head_only,
             )
         }
@@ -291,6 +343,7 @@ fn serve_asset(
                 0,
                 full_len,
                 range_header,
+                keep_alive,
                 head_only,
             )
         }
@@ -307,6 +360,7 @@ fn serve_asset(
             *offset,
             *length,
             range_header,
+            keep_alive,
             head_only,
         ),
     }
@@ -321,6 +375,7 @@ fn serve_sliced_file(
     offset: u64,
     full_len: u64,
     range_header: Option<&str>,
+    keep_alive: bool,
     head_only: bool,
 ) -> io::Result<()> {
     let range = parse_range(range_header, full_len)?;
@@ -337,13 +392,7 @@ fn serve_sliced_file(
         end.saturating_sub(start).saturating_add(1)
     };
     let range_hdr = range.map(|(s, e)| format!("bytes {}-{}/{}", s, e, full_len));
-    let level = if range_header.is_none() {
-        log::Level::Debug
-    } else {
-        log::Level::Trace
-    };
-    log::log!(
-        level,
+    log::trace!(
         "serving file {} src={} offset={} len={} body_len={} range={:?} head_only={}",
         request_path,
         path.display(),
@@ -356,11 +405,14 @@ fn serve_sliced_file(
     // Send headers first, then stream body in chunks — avoids reading entire file into RAM.
     send_response(
         stream,
-        (status_code, status_msg),
-        content_type,
-        range_hdr.as_deref(),
-        body_len,
-        &[],
+        Response {
+            status: (status_code, status_msg),
+            content_type,
+            content_range: range_hdr.as_deref(),
+            content_length: body_len,
+            body: &[],
+        },
+        keep_alive,
         head_only,
     )?;
     if !head_only && body_len > 0 {
@@ -387,27 +439,38 @@ fn stream_file(stream: &mut TcpStream, path: &PathBuf, start: u64, len: u64) -> 
     writer.flush()
 }
 
+struct Response<'a> {
+    status: (u16, &'a str),
+    content_type: &'a str,
+    content_range: Option<&'a str>,
+    content_length: u64,
+    body: &'a [u8],
+}
+
 fn send_response(
     stream: &mut TcpStream,
-    status: (u16, &str),
-    content_type: &str,
-    content_range: Option<&str>,
-    content_length: u64,
-    body: &[u8],
+    resp: Response,
+    keep_alive: bool,
     head_only: bool,
 ) -> io::Result<()> {
-    let mut header = format!("HTTP/1.1 {} {}\r\n", status.0, status.1);
-    header.push_str(&format!("Content-Type: {}\r\n", content_type));
-    header.push_str(&format!("Content-Length: {}\r\n", content_length));
+    let mut header = format!("HTTP/1.1 {} {}\r\n", resp.status.0, resp.status.1);
+    header.push_str(&format!("Content-Type: {}\r\n", resp.content_type));
+    header.push_str(&format!("Content-Length: {}\r\n", resp.content_length));
     header.push_str("Accept-Ranges: bytes\r\n");
-    header.push_str("Connection: close\r\n");
-    if let Some(cr) = content_range {
+    if keep_alive {
+        header.push_str("Connection: keep-alive\r\n");
+    } else {
+        header.push_str("Connection: close\r\n");
+    }
+    // Add dummy Last-Modified to help iPXE cache consistency during SAN boot
+    header.push_str("Last-Modified: Fri, 24 Apr 2026 12:00:00 GMT\r\n");
+    if let Some(cr) = resp.content_range {
         header.push_str(&format!("Content-Range: {}\r\n", cr));
     }
     header.push_str("\r\n");
     stream.write_all(header.as_bytes())?;
     if !head_only {
-        stream.write_all(body)?;
+        stream.write_all(resp.body)?;
     }
     Ok(())
 }
@@ -613,5 +676,49 @@ mod tests {
             "GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[test]
+    fn keep_alive_serves_multiple_requests() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = test_server();
+        let server2 = HttpServer {
+            listener: server.listener.try_clone().expect("clone listener"),
+            assets: Arc::clone(&server.assets),
+        };
+        let server_shutdown = Arc::clone(&shutdown);
+        let addr = server2.local_addr().expect("local addr");
+        let handle = thread::spawn(move || server2.serve_until_shutdown(&server_shutdown));
+
+        let mut stream;
+        loop {
+            if let Ok(s) = TcpStream::connect(addr) {
+                stream = s;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Two requests on the same connection; second includes Connection: close
+        let req1 = "GET /boot/vmlinuz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let req2 = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(req1.as_bytes()).expect("write req1");
+        stream.write_all(req2.as_bytes()).expect("write req2");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+
+        shutdown.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("server thread")
+            .expect("server result");
+
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("abcdefgh"));
+        assert!(response.contains("ok\n"));
     }
 }
