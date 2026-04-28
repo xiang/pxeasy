@@ -87,14 +87,7 @@ pub fn run_windows_start(
         network.ip,
         assets,
         default_ipxe_tftp_files(arch)?,
-        DhcpBoot {
-            first_stage_bootfile: "ipxe.efi".to_string(),
-            bios_bootfile: None,
-            x64_uefi_bootfile: None,
-            arm64_uefi_bootfile: None,
-            ipxe_bootfile: Some(ipxe_boot_file),
-            root_path: None,
-        },
+        DhcpBoot::ipxe(ipxe_boot_file),
     )?;
 
     let smb = SmbServer::bind(SmbConfig::new(
@@ -129,11 +122,7 @@ pub fn run_windows_start(
         runner.run()
     });
 
-    Ok(RuntimeSession {
-        info,
-        shutdown,
-        worker: Some(worker),
-    })
+    Ok(RuntimeSession::new(info, shutdown, worker))
 }
 
 fn prepare_windows_boot_wim(

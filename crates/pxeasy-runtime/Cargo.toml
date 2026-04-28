@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytes = "1"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-rs"] }
 if-addrs = "0.13"
 log = "0.4"
 pxe-dhcp = { path = "../pxe-dhcp" }

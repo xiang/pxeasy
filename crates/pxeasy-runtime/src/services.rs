@@ -38,6 +38,50 @@ pub struct DhcpBoot {
     pub root_path: Option<String>,
 }
 
+impl DhcpBoot {
+    pub fn new(first_stage_bootfile: impl Into<String>) -> Self {
+        Self {
+            first_stage_bootfile: first_stage_bootfile.into(),
+            bios_bootfile: None,
+            x64_uefi_bootfile: None,
+            arm64_uefi_bootfile: None,
+            ipxe_bootfile: None,
+            root_path: None,
+        }
+    }
+
+    pub fn ipxe(ipxe_bootfile: impl Into<String>) -> Self {
+        Self::new("ipxe.efi")
+            .with_bios_bootfile("ipxe.pxe")
+            .with_ipxe_bootfile(ipxe_bootfile)
+    }
+
+    pub fn with_bios_bootfile(mut self, bootfile: impl Into<String>) -> Self {
+        self.bios_bootfile = Some(bootfile.into());
+        self
+    }
+
+    pub fn with_x64_uefi_bootfile(mut self, bootfile: impl Into<String>) -> Self {
+        self.x64_uefi_bootfile = Some(bootfile.into());
+        self
+    }
+
+    pub fn with_arm64_uefi_bootfile(mut self, bootfile: impl Into<String>) -> Self {
+        self.arm64_uefi_bootfile = Some(bootfile.into());
+        self
+    }
+
+    pub fn with_ipxe_bootfile(mut self, bootfile: impl Into<String>) -> Self {
+        self.ipxe_bootfile = Some(bootfile.into());
+        self
+    }
+
+    pub fn with_root_path(mut self, root_path: impl Into<String>) -> Self {
+        self.root_path = Some(root_path.into());
+        self
+    }
+}
+
 impl CoreServers {
     pub fn bind(
         network_ip: Ipv4Addr,

@@ -106,7 +106,13 @@ pub fn run_core_start(
 
 pub fn default_ipxe_tftp_files(arch: Architecture) -> Result<HashMap<String, Bytes>, String> {
     let mut tftp_files = HashMap::new();
-    tftp_files.insert("ipxe.efi".to_string(), Bytes::from(fetch_ipxe(arch)?));
+    tftp_files.insert("ipxe.efi".to_string(), Bytes::from(fetch_ipxe(arch, true)?));
+    if matches!(arch, Architecture::Amd64) {
+        tftp_files.insert(
+            "ipxe.pxe".to_string(),
+            Bytes::from(fetch_ipxe(arch, false)?),
+        );
+    }
     Ok(tftp_files)
 }
 
@@ -156,23 +162,32 @@ pub fn require_known_architecture(arch: Architecture) -> Result<Architecture, St
     }
 }
 
-fn fetch_ipxe(arch: Architecture) -> Result<Vec<u8>, String> {
+fn fetch_ipxe(arch: Architecture, uefi: bool) -> Result<Vec<u8>, String> {
     let cache_dir = std::env::temp_dir().join("pxeasy-ipxe");
     std::fs::create_dir_all(&cache_dir)
         .map_err(|e| format!("error: failed to create iPXE cache dir: {e}"))?;
 
-    let url = match arch {
-        Architecture::Unknown => {
-            return Err("error: unsupported iPXE architecture: unknown".to_string());
+    let url = match (arch, uefi) {
+        (Architecture::Amd64, true) => "https://boot.ipxe.org/snponly.efi",
+        (Architecture::Amd64, false) => "https://boot.ipxe.org/undionly.kpxe",
+        (Architecture::Arm64, true) => "https://boot.ipxe.org/arm64-efi/snponly.efi",
+        _ => {
+            return Err(format!(
+                "error: unsupported iPXE configuration: arch={:?}, uefi={}",
+                arch, uefi
+            ));
         }
-        Architecture::Amd64 => "https://boot.ipxe.org/snponly.efi",
-        Architecture::Arm64 => "https://boot.ipxe.org/arm64-efi/snponly.efi",
     };
 
     let arch_slug = arch
         .slug()
         .ok_or_else(|| "error: unsupported iPXE architecture: unknown".to_string())?;
-    let local_path = cache_dir.join(format!("snponly-{arch_slug}.efi"));
+    let filename = if uefi {
+        format!("snponly-{arch_slug}.efi")
+    } else {
+        format!("undionly-{arch_slug}.kpxe")
+    };
+    let local_path = cache_dir.join(filename);
 
     if !local_path.exists() {
         info!("downloading iPXE payload from {}", url);

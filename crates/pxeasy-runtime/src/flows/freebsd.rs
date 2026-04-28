@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use log::{debug, info};
 use pxe_diskimg::{DiskImage, Partition, PartitionSource, PartitionType};
@@ -18,8 +21,8 @@ use crate::{
     DEFAULT_HTTP_PORT,
 };
 
-const FREEBSD_MFS_DISK_SIZE: u64 = 1024 * 1024 * 1024; // 1GB default
 const FREEBSD_UFS_BLOCK_SIZE: u64 = 32768; // 32KB
+const FREEBSD_STAGE_PROGRESS_INTERVAL: u64 = 1_000;
 
 pub fn run_freebsd_start(
     source_path: PathBuf,
@@ -57,14 +60,7 @@ pub fn run_freebsd_start(
         network,
         assets,
         default_ipxe_tftp_files(arch)?,
-        DhcpBoot {
-            first_stage_bootfile: "ipxe.efi".to_string(),
-            bios_bootfile: None,
-            x64_uefi_bootfile: None,
-            arm64_uefi_bootfile: None,
-            ipxe_bootfile: Some(ipxe_boot_file),
-            root_path: None,
-        },
+        DhcpBoot::ipxe(ipxe_boot_file),
         None,
     )
 }
@@ -100,14 +96,7 @@ fn run_freebsd_iso_start_sanboot(
         network,
         assets,
         default_ipxe_tftp_files(arch)?,
-        DhcpBoot {
-            first_stage_bootfile: "ipxe.efi".to_string(),
-            bios_bootfile: None,
-            x64_uefi_bootfile: None,
-            arm64_uefi_bootfile: None,
-            ipxe_bootfile: Some(ipxe_boot_file),
-            root_path: None,
-        },
+        DhcpBoot::ipxe(ipxe_boot_file),
         None,
     )
 }
@@ -131,7 +120,7 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
     let cached_img = cache_dir.join(format!("freebsd-{}.img", arch_slug));
     let cached_meta = cache_dir.join(format!("freebsd-{}.meta", arch_slug));
     let expected_meta = format!(
-        "iso_size={}\niso_mtime={}\narch={}\n",
+        "format=uncompressed-mfsroot-v1\niso_size={}\niso_mtime={}\narch={}\n",
         source_metadata.len(),
         modified_secs,
         arch_slug
@@ -150,10 +139,10 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
     }
 
     info!("generating custom FreeBSD sanboot image (this may take a minute)...");
-
-    // 1. Extract ISO
-    let extracted_iso = extract_iso(source_path)?;
-    let iso_root = extracted_iso.path();
+    info!("extracting FreeBSD bootonly ISO...");
+    let extracted = extract_iso(source_path)?;
+    let extracted_root = extracted.path();
+    info!("staging FreeBSD boot assets from extracted ISO...");
 
     // 2. Prepare ESP directory
     let tempdir = tempfile::tempdir()
@@ -162,66 +151,84 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
     let efi_boot_dir = esp_dir.join("EFI/BOOT");
     fs::create_dir_all(&efi_boot_dir).map_err(|e| e.to_string())?;
 
-    let loader_efi_src = iso_root.join("boot/loader.efi");
     let efi_name = match arch {
         Architecture::Amd64 => "BOOTX64.EFI",
         Architecture::Arm64 => "BOOTAA64.EFI",
         _ => return Err("error: unsupported architecture for FreeBSD".to_string()),
     };
-    fs::copy(&loader_efi_src, efi_boot_dir.join(efi_name)).map_err(|e| e.to_string())?;
+    fs::copy(
+        extracted_root.join("boot/loader.efi"),
+        efi_boot_dir.join(efi_name),
+    )
+    .map_err(|e| format!("error: failed to copy /boot/loader.efi from extracted ISO: {e}"))?;
 
     // 3. Prepare MFSROOT (UFS image of installer root)
     // We include everything EXCEPT /boot in the mfsroot
     let mfsroot_dir = tempdir.path().join("mfsroot_tree");
     fs::create_dir_all(&mfsroot_dir).map_err(|e| e.to_string())?;
-
-    for entry in
-        fs::read_dir(iso_root).map_err(|e| format!("error: failed to read ISO root: {e}"))?
+    let mut stage_stats = StageStats::new("mfsroot staging");
+    for entry in fs::read_dir(extracted_root)
+        .map_err(|e| format!("error: failed to read extracted ISO root: {e}"))?
     {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name();
-        if name == "boot" {
+        let entry = entry.map_err(|e| format!("error: failed to read extracted ISO entry: {e}"))?;
+        if entry.file_name() == "boot" {
             continue;
         }
-        let dest = mfsroot_dir.join(&name);
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest)?;
-        } else {
-            fs::copy(entry.path(), &dest).map_err(|e| e.to_string())?;
-        }
+        info!(
+            "staging FreeBSD entry {} into mfsroot...",
+            entry.path().display()
+        );
+        copy_dir_entry(
+            &entry.path(),
+            &mfsroot_dir.join(entry.file_name()),
+            &mut stage_stats,
+        )?;
     }
+    stage_stats.finish();
+
+    // The ISO's /etc/fstab specifies root as cd9660. Override for UFS mfsroot boot.
+    fs::write(
+        mfsroot_dir.join("etc/fstab"),
+        "/dev/md0\t/\tufs\trw\t1\t1\n",
+    )
+    .map_err(|e| format!("error: failed to write mfsroot fstab: {e}"))?;
 
     let mfsroot_img = tempdir.path().join("mfsroot.img");
-    // Estimate size: sum of files + 20% overhead
-    let mfsroot_size = dir_size(&mfsroot_dir)? + (50 * 1024 * 1024); // Add 50MB overhead
+    // Estimate size: sum of files + overhead for UFS fragments and metadata.
+    // 27,000+ files require at least 100MB of fragment overhead (4KB min per file).
+    info!("estimating staged FreeBSD mfsroot size...");
+    let mfsroot_size = dir_size(&mfsroot_dir)? + (150 * 1024 * 1024); // 150MB buffer
     let mfsroot_size = mfsroot_size.div_ceil(FREEBSD_UFS_BLOCK_SIZE) * FREEBSD_UFS_BLOCK_SIZE;
+    info!(
+        "writing FreeBSD mfsroot UFS image ({} bytes)...",
+        mfsroot_size
+    );
     let ufs_writer = pxe_ufs::UfsWriter::new(mfsroot_size, "mfsroot");
     ufs_writer
         .write(&mfsroot_dir, &mfsroot_img)
         .map_err(|e| format!("error: UFS write failed: {:?}", e))?;
 
-    // 4. Gzip mfsroot
-    let mfsroot_gz = tempdir.path().join("mfsroot.gz");
-    let mut mfs_file = File::open(&mfsroot_img).map_err(|e| e.to_string())?;
-    let gz_file = File::create(&mfsroot_gz).map_err(|e| e.to_string())?;
-    let mut encoder = flate2::write::GzEncoder::new(gz_file, flate2::Compression::default());
-    std::io::copy(&mut mfs_file, &mut encoder).map_err(|e| e.to_string())?;
-    encoder.finish().map_err(|e| e.to_string())?;
-
-    // 5. Prepare ROOT directory (contains /boot and mfsroot.gz)
+    // 4. Prepare ROOT directory (contains /boot and uncompressed mfsroot)
     let root_dir = tempdir.path().join("root");
     fs::create_dir_all(&root_dir).map_err(|e| e.to_string())?;
-    copy_dir_recursive(&iso_root.join("boot"), &root_dir.join("boot"))?;
-    fs::copy(&mfsroot_gz, root_dir.join("mfsroot.gz")).map_err(|e| e.to_string())?;
+    info!("staging FreeBSD /boot tree into root partition...");
+    let mut root_stage_stats = StageStats::new("root staging");
+    copy_dir_entry(
+        &extracted_root.join("boot"),
+        &root_dir.join("boot"),
+        &mut root_stage_stats,
+    )?;
+    root_stage_stats.finish();
+    fs::copy(&mfsroot_img, root_dir.join("mfsroot")).map_err(|e| e.to_string())?;
 
-    // 6. Create custom loader.conf
-    let loader_conf = "mfsroot_load=\"YES\"\nmfsroot_type=\"mfs_root\"\nmfsroot_name=\"/mfsroot.gz\"\nvfs.root.mountfrom=\"ufs:/dev/md0\"\n".to_string();
+    // 5. Create custom loader.conf
+    let loader_conf = "mfsroot_load=\"YES\"\nmfsroot_type=\"mfs_root\"\nmfsroot_name=\"/mfsroot\"\nvfs.root.mountfrom=\"ufs:/dev/md0\"\n".to_string();
     let mut f = File::create(root_dir.join("boot/loader.conf")).map_err(|e| e.to_string())?;
     f.write_all(loader_conf.as_bytes())
         .map_err(|e| e.to_string())?;
 
-    // 7. Assemble final GPT disk image
-    let mut disk = DiskImage::new(FREEBSD_MFS_DISK_SIZE);
+    // 6. Assemble final GPT disk image
+    let mut disk = DiskImage::new();
 
     // ESP (32MB)
     disk.add_partition(Partition {
@@ -232,7 +239,8 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
     });
 
     // ROOT
-    let root_size = dir_size(&root_dir)? + (64 * 1024 * 1024); // 64MB buffer
+    info!("estimating FreeBSD root partition size...");
+    let root_size = dir_size(&root_dir)? + (128 * 1024 * 1024); // 128MB buffer
     let root_size = root_size.div_ceil(FREEBSD_UFS_BLOCK_SIZE) * FREEBSD_UFS_BLOCK_SIZE;
     disk.add_partition(Partition {
         name: "FREEBSD_ROOT".to_string(),
@@ -241,6 +249,7 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
         source: PartitionSource::Directory(root_dir),
     });
 
+    info!("assembling final FreeBSD GPT disk image...");
     disk.write(&cached_img)
         .map_err(|e| format!("error: failed to write disk image: {e}"))?;
     fs::write(&cached_meta, expected_meta)
@@ -250,32 +259,90 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
     Ok(cached_img)
 }
 
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
-    fs::create_dir_all(dest)
-        .map_err(|e| format!("error: failed to create dir {}: {e}", dest.display()))?;
-    for entry in fs::read_dir(src)
-        .map_err(|e| format!("error: failed to read dir {}: {e}", src.display()))?
-    {
-        let entry = entry.map_err(|e| format!("error: failed to read entry: {e}"))?;
-        let path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        if entry
-            .file_type()
-            .map_err(|e| format!("error: failed to stat {}: {e}", path.display()))?
-            .is_dir()
-        {
-            copy_dir_recursive(&path, &dest_path)?;
-        } else {
-            fs::copy(&path, &dest_path).map_err(|e| {
-                format!(
-                    "error: failed to copy {} to {}: {e}",
-                    path.display(),
-                    dest_path.display()
-                )
-            })?;
+struct StageStats {
+    label: &'static str,
+    started_at: Instant,
+    entries: u64,
+}
+
+impl StageStats {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            started_at: Instant::now(),
+            entries: 0,
         }
     }
-    Ok(())
+
+    fn record(&mut self, path: &Path) {
+        self.entries += 1;
+        if self.entries.is_multiple_of(FREEBSD_STAGE_PROGRESS_INTERVAL) {
+            info!(
+                "{} progress: {} entries processed in {:.1}s (latest: {})",
+                self.label,
+                self.entries,
+                self.started_at.elapsed().as_secs_f32(),
+                path.display()
+            );
+        }
+    }
+
+    fn finish(&self) {
+        info!(
+            "{} complete: {} entries processed in {:.1}s",
+            self.label,
+            self.entries,
+            self.started_at.elapsed().as_secs_f32()
+        );
+    }
+}
+
+fn copy_dir_entry(src: &Path, dest: &Path, stats: &mut StageStats) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(src)
+        .map_err(|e| format!("error: failed to stat {}: {e}", src.display()))?;
+    stats.record(src);
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(src)
+            .map_err(|e| format!("error: failed to read symlink {}: {e}", src.display()))?;
+        #[cfg(unix)]
+        {
+            unix_fs::symlink(&target, dest).map_err(|e| {
+                format!(
+                    "error: failed to copy symlink {} to {}: {e}",
+                    src.display(),
+                    dest.display()
+                )
+            })?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(format!(
+                "error: cannot copy symlink {} on this platform",
+                src.display()
+            ));
+        }
+    }
+
+    if metadata.is_dir() {
+        fs::create_dir_all(dest)
+            .map_err(|e| format!("error: failed to create dir {}: {e}", dest.display()))?;
+        for entry in fs::read_dir(src)
+            .map_err(|e| format!("error: failed to read dir {}: {e}", src.display()))?
+        {
+            let entry = entry.map_err(|e| format!("error: failed to read entry: {e}"))?;
+            copy_dir_entry(&entry.path(), &dest.join(entry.file_name()), stats)?;
+        }
+        return Ok(());
+    }
+
+    fs::copy(src, dest).map(|_| ()).map_err(|e| {
+        format!(
+            "error: failed to copy {} to {}: {e}",
+            src.display(),
+            dest.display()
+        )
+    })
 }
 
 fn dir_size(path: &Path) -> Result<u64, String> {
@@ -284,8 +351,7 @@ fn dir_size(path: &Path) -> Result<u64, String> {
         .map_err(|e| format!("error: failed to read dir {}: {e}", path.display()))?
     {
         let entry = entry.map_err(|e| format!("error: failed to read entry: {e}"))?;
-        let meta = entry
-            .metadata()
+        let meta = fs::symlink_metadata(entry.path())
             .map_err(|e| format!("error: failed to stat {}: {e}", entry.path().display()))?;
         if meta.is_dir() {
             size += dir_size(&entry.path())?;
@@ -304,4 +370,58 @@ pub fn is_freebsd_boot_image(path: &Path) -> bool {
                 || ext.eq_ignore_ascii_case("img")
                 || ext.eq_ignore_ascii_case("raw")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_dir_entry, dir_size, StageStats};
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_entry_preserves_directory_symlinks() {
+        let src_root = tempdir().expect("tempdir");
+        let dest_root = tempdir().expect("tempdir");
+
+        let include_dir = src_root.path().join("include");
+        fs::create_dir_all(&include_dir).expect("create include dir");
+        fs::write(include_dir.join("header.h"), "test").expect("write include file");
+
+        let usr_lib = src_root.path().join("usr/lib");
+        fs::create_dir_all(&usr_lib).expect("create usr/lib");
+        let link_path = usr_lib.join("include");
+        unix_fs::symlink("../../include", &link_path).expect("create symlink");
+
+        let copied_link = dest_root.path().join("include");
+        let mut stats = StageStats::new("test");
+        copy_dir_entry(&link_path, &copied_link, &mut stats).expect("copy symlink");
+
+        let copied_meta = fs::symlink_metadata(&copied_link).expect("copied symlink metadata");
+        assert!(copied_meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&copied_link).expect("read copied symlink"),
+            PathBuf::from("../../include")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_does_not_follow_directory_symlinks() {
+        let root = tempdir().expect("tempdir");
+        let include_dir = root.path().join("include");
+        fs::create_dir_all(&include_dir).expect("create include dir");
+        fs::write(include_dir.join("header.h"), vec![0_u8; 1024]).expect("write include file");
+
+        let usr_lib = root.path().join("usr/lib");
+        fs::create_dir_all(&usr_lib).expect("create usr/lib");
+        unix_fs::symlink("../../include", usr_lib.join("include")).expect("create symlink");
+
+        let size = dir_size(root.path()).expect("dir size");
+        assert!(size < 2048, "unexpected symlink-following size: {size}");
+    }
 }

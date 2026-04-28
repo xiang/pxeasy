@@ -24,9 +24,9 @@ pub struct RuntimeInfo {
 }
 
 pub struct RuntimeSession {
-    pub info: RuntimeInfo,
-    pub shutdown: Arc<AtomicBool>,
-    pub worker: Option<thread::JoinHandle<Result<(), String>>>,
+    info: RuntimeInfo,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<Result<(), String>>>,
 }
 
 impl RuntimeSession {
