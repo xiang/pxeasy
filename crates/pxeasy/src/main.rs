@@ -40,7 +40,12 @@ fn run_start(command: StartCommand) -> Result<(), String> {
         interface: command.interface,
         bind_ip: command.bind_ip,
         ipxe_boot_file: command.ipxe_boot_file,
+        autoinstall: command.autoinstall,
     })?;
+
+    if let Err(err) = drop_privileges() {
+        log::warn!("failed to drop privileges: {}", err);
+    }
 
     let mut printed = false;
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -86,8 +91,10 @@ fn run_daemon(command: DaemonCommand) -> Result<(), String> {
         interface: command.interface,
         bind_ip: command.bind_ip,
         ipxe_boot_file: command.ipxe_boot_file,
+        autoinstall: command.autoinstall,
     })
 }
+
 
 fn install_signal_handler(shutdown: &Arc<AtomicBool>) -> Result<(), String> {
     let shutdown = Arc::clone(shutdown);
@@ -110,4 +117,60 @@ fn print_session_info(info: &SessionInfo) {
         println!("[pxeasy] SMB:       \\\\{}\\{}", smb.ip(), share_name);
     }
     println!("[pxeasy] Ready — waiting for PXE clients");
+}
+
+#[cfg(unix)]
+fn drop_privileges() -> Result<(), String> {
+    let sudo_uid = std::env::var("SUDO_UID").ok();
+    let sudo_gid = std::env::var("SUDO_GID").ok();
+
+    if let (Some(uid_str), Some(gid_str)) = (sudo_uid, sudo_gid) {
+        let uid = uid_str.parse::<u32>().map_err(|_| "invalid SUDO_UID")?;
+        let gid = gid_str.parse::<u32>().map_err(|_| "invalid SUDO_GID")?;
+
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|h| h.join(".pxeasy"));
+
+        if let Some(home) = home {
+            if home.exists() {
+                chown_recursive(&home, uid, gid)
+                    .map_err(|e| format!("failed to change ownership of {}: {}", home.display(), e))?;
+            }
+        }
+
+        unsafe {
+            if libc::setgid(gid) != 0 {
+                return Err(format!(
+                    "failed to setgid: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if libc::setuid(uid) != 0 {
+                return Err(format!(
+                    "failed to setuid: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn drop_privileges() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_recursive(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::chown;
+    chown(path, Some(uid), Some(gid))?;
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            chown_recursive(&entry.path(), uid, gid)?;
+        }
+    }
+    Ok(())
 }

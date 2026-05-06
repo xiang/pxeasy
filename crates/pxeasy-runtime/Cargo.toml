@@ -18,4 +18,5 @@ pxe-smb = { path = "../pxe-smb" }
 pxe-tftp = { path = "../pxe-tftp" }
 pxe-ufs = { path = "../pxe-ufs" }
 pxe-wim = { path = "../pxe-wim" }
+pxe-autoinstall = { path = "../pxe-autoinstall" }
 tempfile = "3"

@@ -6,6 +6,7 @@ use std::{
 
 use config::{Config, File, FileFormat};
 use pico_args::Arguments;
+use pxe_autoinstall::AutoInstallConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +14,7 @@ struct ConfigOverrides {
     interface: Option<String>,
     bind_ip: Option<Ipv4Addr>,
     ipxe_boot_file: Option<String>,
+    autoinstall: Option<AutoInstallConfig>,
 }
 
 pub struct StartCommand {
@@ -20,6 +22,7 @@ pub struct StartCommand {
     pub interface: Option<String>,
     pub bind_ip: Option<Ipv4Addr>,
     pub ipxe_boot_file: Option<String>,
+    pub autoinstall: Option<AutoInstallConfig>,
 }
 
 pub struct DaemonCommand {
@@ -27,6 +30,7 @@ pub struct DaemonCommand {
     pub interface: Option<String>,
     pub bind_ip: Option<Ipv4Addr>,
     pub ipxe_boot_file: Option<String>,
+    pub autoinstall: Option<AutoInstallConfig>,
 }
 
 pub enum CliCommand {
@@ -53,6 +57,7 @@ where
                 interface: command.interface,
                 bind_ip: command.bind_ip,
                 ipxe_boot_file: command.ipxe_boot_file,
+                autoinstall: command.autoinstall,
             })
         }),
         other => Err(usage_error(&format!("unsupported command: {other}"))),
@@ -87,6 +92,7 @@ fn parse_cli_overrides(pargs: &mut Arguments) -> Result<ConfigOverrides, String>
         interface,
         bind_ip,
         ipxe_boot_file: None,
+        autoinstall: None,
     })
 }
 
@@ -123,6 +129,7 @@ fn apply_overrides(
         interface: cli_overrides.interface.or(file_overrides.interface),
         bind_ip: cli_overrides.bind_ip.or(file_overrides.bind_ip),
         ipxe_boot_file: file_overrides.ipxe_boot_file,
+        autoinstall: file_overrides.autoinstall,
     }
 }
 

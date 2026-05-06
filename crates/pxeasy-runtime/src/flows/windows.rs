@@ -27,8 +27,6 @@ pub const DEFAULT_SMB_PORT: u16 = 445;
 const WINDOWS_SOURCE_WINPE_IMAGE: i32 = 2;
 const WINDOWS_CUSTOM_WINPE_IMAGE: i32 = 1;
 
-const DEFAULT_WINDOWS_STARTNET_TEMPLATE: &str =
-    include_str!("../../../../templates/windows/startnet.cmd");
 const DEFAULT_WINDOWS_WINPESHL_TEMPLATE: &str =
     include_str!("../../../../templates/windows/winpeshl.ini");
 const DEFAULT_WINDOWS_BOOTSTRAP_TEMPLATE: &str =
@@ -39,11 +37,12 @@ pub fn run_windows_start(
     ipxe_boot_file: Option<String>,
     network: NetworkSelection,
     profile: WindowsProfile,
+    autoinstall: Option<pxe_autoinstall::AutoInstallConfig>,
 ) -> Result<RuntimeSession, String> {
     let arch = require_known_architecture(profile.architecture)?;
     let cached_wimboot = fetch_wimboot(arch)?;
     let prepared_boot_wim =
-        prepare_windows_boot_wim(&source_path, &profile.boot_wim_path, network.ip, arch)?;
+        prepare_windows_boot_wim(&source_path, &profile.boot_wim_path, network.ip, arch, autoinstall)?;
 
     let mut assets = HashMap::new();
     add_windows_iso_asset(
@@ -130,6 +129,7 @@ fn prepare_windows_boot_wim(
     boot_wim_path: &str,
     server_ip: Ipv4Addr,
     arch: Architecture,
+    autoinstall: Option<pxe_autoinstall::AutoInstallConfig>,
 ) -> Result<PathBuf, String> {
     let source_metadata = fs::metadata(source_path)
         .map_err(|err| format!("error: failed to stat {}: {err}", source_path.display()))?;
@@ -142,28 +142,36 @@ fn prepare_windows_boot_wim(
         .as_secs();
 
     let virtio_drivers = windows_virtio_drivers(arch)?;
-    let startnet_script = windows_startnet_cmd()?;
+    debug!("detected {} virtio drivers for {}", virtio_drivers.len(), arch.slug().unwrap_or("unknown"));
+    for drv in &virtio_drivers {
+        debug!("  driver: {} (winpe_load: {})", drv.wim_dir, drv.winpe_load);
+    }
     let winpeshl_ini = Some(render_windows_template(
         "winpeshl.ini",
         DEFAULT_WINDOWS_WINPESHL_TEMPLATE,
         server_ip,
     )?);
-    let bootstrap_script = windows_bootstrap_cmd(server_ip, &virtio_drivers)?;
 
-    let cache_dir = PathBuf::from(format!("{}.pxeasy", source_path.display()));
+    let arch_slug = arch.slug().unwrap_or("amd64");
+    let (autounattend_xml, autounattend_hash) = resolve_autounattend(autoinstall.as_ref(), arch_slug)?;
+    let bootstrap_script = windows_bootstrap_cmd(server_ip, &virtio_drivers, autounattend_xml.is_some())?;
+
+    let windows_dir = pxeasy_home_dir()?.join("windows");
+    let cache_dir = windows_dir.join("cache");
     fs::create_dir_all(&cache_dir)
         .map_err(|err| format!("error: failed to create Windows cache dir: {err}"))?;
 
-    let cached_wim = cache_dir.join("boot.wim");
-    let cached_meta = cache_dir.join("boot.wim.meta");
+    let source_hash = format!("{:016x}", stable_hash(&source_path.to_string_lossy()));
+    let cached_wim = cache_dir.join(format!("boot-{}.wim", source_hash));
+    let cached_meta = cache_dir.join(format!("boot-{}.meta", source_hash));
     let expected_meta = format!(
-        "size={}\nmtime={modified_secs}\nserver_ip={server_ip}\nshare_name={WINDOWS_SHARE_NAME}\narch={}\nvirtio_drivers={}\nstartnet_hash={:016x}\nbootstrap_hash={:016x}\nwinpeshl_hash={}\nsource_image={WINDOWS_SOURCE_WINPE_IMAGE}\n",
+        "size={}\nmtime={modified_secs}\nserver_ip={server_ip}\nshare_name={WINDOWS_SHARE_NAME}\narch={}\nvirtio_drivers={}\nbootstrap_hash={:016x}\nwinpeshl_hash={}\nautounattend_hash={}\nsource_image={WINDOWS_SOURCE_WINPE_IMAGE}\n",
         source_metadata.len(),
         arch.slug().unwrap_or("unknown"),
         windows_virtio_meta(&virtio_drivers),
-        stable_hash(&startnet_script),
         stable_hash(&bootstrap_script),
         winpeshl_ini.as_ref().map(|s| format!("{:016x}", stable_hash(s))).unwrap_or_else(|| "none".to_string()),
+        autounattend_hash,
     );
 
     if cached_wim.exists() {
@@ -179,9 +187,9 @@ fn prepare_windows_boot_wim(
     let tempdir = tempfile::tempdir()
         .map_err(|err| format!("error: failed to create temporary directory: {err}"))?;
     let temp_boot_wim = tempdir.path().join("boot.wim");
-    let startnet_cmd = tempdir.path().join("startnet.cmd");
     let bootstrap_cmd = tempdir.path().join("pxeasy-bootstrap.cmd");
     let winpeshl_ini_path = tempdir.path().join("winpeshl.ini");
+    let autounattend_path = tempdir.path().join("autounattend.xml");
     let source_boot_wim = tempdir.path().join("source-boot.wim");
 
     debug!("extracting source boot.wim from ISO...");
@@ -190,8 +198,6 @@ fn prepare_windows_boot_wim(
 
     fs::write(&source_boot_wim, boot_wim_bytes)
         .map_err(|err| format!("error: failed to write temporary source boot.wim: {err}"))?;
-    fs::write(&startnet_cmd, startnet_script)
-        .map_err(|err| format!("error: failed to write startnet.cmd: {err}"))?;
     fs::write(&bootstrap_cmd, bootstrap_script)
         .map_err(|err| format!("error: failed to write pxeasy-bootstrap.cmd: {err}"))?;
     if let Some(content) = &winpeshl_ini {
@@ -199,17 +205,16 @@ fn prepare_windows_boot_wim(
         fs::write(&winpeshl_ini_path, content)
             .map_err(|err| format!("error: failed to write winpeshl.ini: {err}"))?;
     }
+    if let Some(content) = &autounattend_xml {
+        debug!("writing autounattend.xml to boot image...");
+        fs::write(&autounattend_path, content)
+            .map_err(|err| format!("error: failed to write autounattend.xml: {err}"))?;
+    }
 
     debug!("exporting WIM image...");
     Wim::export_image_to_new_wim(&source_boot_wim, WINDOWS_SOURCE_WINPE_IMAGE, &temp_boot_wim)?;
 
     let mut wim = Wim::open_for_update(&temp_boot_wim)?;
-    debug!("injecting custom startnet.cmd...");
-    wim.replace_file(
-        WINDOWS_CUSTOM_WINPE_IMAGE,
-        &startnet_cmd,
-        "/Windows/System32/startnet.cmd",
-    )?;
     debug!("injecting custom pxeasy-bootstrap.cmd...");
     wim.replace_file(
         WINDOWS_CUSTOM_WINPE_IMAGE,
@@ -222,6 +227,14 @@ fn prepare_windows_boot_wim(
             WINDOWS_CUSTOM_WINPE_IMAGE,
             &winpeshl_ini_path,
             "/Windows/System32/winpeshl.ini",
+        )?;
+    }
+    if autounattend_xml.is_some() {
+        debug!("injecting autounattend.xml...");
+        wim.replace_file(
+            WINDOWS_CUSTOM_WINPE_IMAGE,
+            &autounattend_path,
+            "/autounattend.xml",
         )?;
     }
     for driver in &virtio_drivers {
@@ -245,14 +258,10 @@ fn prepare_windows_boot_wim(
     Ok(cached_wim)
 }
 
-fn windows_startnet_cmd() -> Result<String, String> {
-    let template = load_windows_template("startnet.cmd", DEFAULT_WINDOWS_STARTNET_TEMPLATE)?;
-    Ok(template.replace("\r\n", "\n").replace('\n', "\r\n"))
-}
-
 fn windows_bootstrap_cmd(
     server_ip: Ipv4Addr,
     virtio_drivers: &[WindowsVirtioDriver],
+    use_unattend: bool,
 ) -> Result<String, String> {
     let template =
         load_windows_template("pxeasy-bootstrap.cmd", DEFAULT_WINDOWS_BOOTSTRAP_TEMPLATE)?;
@@ -262,20 +271,21 @@ fn windows_bootstrap_cmd(
             continue;
         }
         for inf_path in &driver.inf_paths {
-            drvload_lines.push_str(&format!("drvload X:{inf_path}\n"));
+            let win_path = inf_path.replace("/", "\\");
+            drvload_lines.push_str(&format!("drvload X:{win_path}\n"));
         }
     }
-    let post_drvload_network_init = if drvload_lines.is_empty() {
-        String::new()
+    let unattend_arg = if use_unattend {
+        "/unattend:X:\\autounattend.xml"
     } else {
-        "wpeutil InitializeNetwork\n".to_string()
+        ""
     };
 
     let script = template
         .replace("{{DRVLOAD_LINES}}", &drvload_lines)
-        .replace("{{POST_DRVLOAD_NETWORK_INIT}}", &post_drvload_network_init)
         .replace("{{SERVER_IP}}", &server_ip.to_string())
-        .replace("{{SHARE_NAME}}", WINDOWS_SHARE_NAME);
+        .replace("{{SHARE_NAME}}", WINDOWS_SHARE_NAME)
+        .replace("{{UNATTEND_ARG}}", unattend_arg);
 
     Ok(script.replace("\r\n", "\n").replace('\n', "\r\n"))
 }
@@ -304,21 +314,53 @@ fn load_windows_template(template_name: &str, default_template: &str) -> Result<
 }
 
 fn ensure_windows_template(template_name: &str, default_template: &str) -> Result<PathBuf, String> {
-    let template_dir = pxeasy_home_dir()?.join("templates/windows");
+    let template_dir = pxeasy_home_dir()?.join("windows/assets");
     fs::create_dir_all(&template_dir)
-        .map_err(|err| format!("error: failed to create Windows template dir: {err}"))?;
+        .map_err(|err| format!("error: failed to create Windows assets dir: {err}"))?;
 
     let template_path = template_dir.join(template_name);
     if !template_path.exists() {
         fs::write(&template_path, default_template).map_err(|err| {
             format!(
-                "error: failed to initialize Windows template {}: {err}",
+                "error: failed to initialize Windows asset {}: {err}",
                 template_path.display()
             )
         })?;
     }
 
     Ok(template_path)
+}
+
+fn resolve_autounattend(
+    config: Option<&pxe_autoinstall::AutoInstallConfig>,
+    arch: &str,
+) -> Result<(Option<String>, String), String> {
+    let autoinstall_dir = pxeasy_home_dir()?.join("windows/autoinstall");
+    fs::create_dir_all(&autoinstall_dir)
+        .map_err(|err| format!("error: failed to create Windows autoinstall dir: {err}"))?;
+
+    let custom_path = autoinstall_dir.join("autounattend.xml");
+    if custom_path.exists() {
+        let content = fs::read_to_string(&custom_path).map_err(|err| {
+            format!(
+                "error: failed to read custom autounattend.xml at {}: {err}",
+                custom_path.display()
+            )
+        })?;
+        let hash = format!("{:016x}", stable_hash(&content));
+        return Ok((Some(content), hash));
+    }
+
+    if let Some(config) = config {
+        if config.enabled {
+            let merged = config.for_os(config.windows.as_ref());
+            let content = pxe_autoinstall::generate_unattend(&merged, arch, None);
+            let hash = format!("{:016x}", stable_hash(&content));
+            return Ok((Some(content), hash));
+        }
+    }
+
+    Ok((None, "none".to_string()))
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -358,7 +400,20 @@ fn windows_virtio_drivers(arch: Architecture) -> Result<Vec<WindowsVirtioDriver>
             continue;
         }
 
-        let host_dir = entry.path().join("w11").join(arch_subdir);
+        let mut host_dir = entry.path().join(arch_subdir).join("w11");
+        if !host_dir.is_dir() {
+            host_dir = entry.path().join(arch_subdir).join("w10");
+        }
+        if !host_dir.is_dir() {
+            host_dir = entry.path().join("w11").join(arch_subdir);
+        }
+        if !host_dir.is_dir() {
+            host_dir = entry.path().join("w10").join(arch_subdir);
+        }
+        if !host_dir.is_dir() {
+            host_dir = entry.path().join(arch_subdir);
+        }
+
         if !host_dir.is_dir() {
             continue;
         }
@@ -389,7 +444,7 @@ fn windows_virtio_drivers(arch: Architecture) -> Result<Vec<WindowsVirtioDriver>
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("error: non-UTF-8 INF path: {}", path.display()))?;
-            inf_paths.push(format!("/Drivers/{driver_name}/{file_name}"));
+            inf_paths.push(format!("\\Drivers\\{driver_name}\\{file_name}"));
         }
 
         if inf_paths.is_empty() {
@@ -398,8 +453,10 @@ fn windows_virtio_drivers(arch: Architecture) -> Result<Vec<WindowsVirtioDriver>
         inf_paths.sort();
 
         let name_lower = driver_name.to_lowercase();
-        let winpe_load =
-            name_lower == "netkvm" || name_lower == "vioscsi" || name_lower == "viostor";
+        // Load only storage/network in WinPE for stability,
+        // but inject ALL drivers into the WIM for the /m setup flag.
+        let winpe_load = name_lower == "netkvm" || name_lower == "vioscsi" || name_lower == "viostor";
+
         drivers.push(WindowsVirtioDriver {
             host_dir,
             wim_dir: format!("/Drivers/{driver_name}"),
@@ -423,6 +480,13 @@ fn windows_virtio_root() -> Result<Option<PathBuf>, String> {
             ));
         }
         return Ok(Some(path));
+    }
+
+    for rel_path in &["assets/windows/virtio-win", "virtio-win"] {
+        let path = PathBuf::from(rel_path);
+        if path.is_dir() {
+            return Ok(Some(path));
+        }
     }
 
     let path = pxeasy_home_dir()?.join("dev/windows/virtio-win");

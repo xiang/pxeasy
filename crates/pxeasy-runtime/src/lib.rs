@@ -35,6 +35,7 @@ pub fn inspect_source(source_path: &Path) -> Result<ResolvedSource, String> {
 }
 
 pub fn start(request: LaunchRequest) -> Result<RuntimeSession, String> {
+    ensure_example_config()?;
     let network = resolve_network(request.interface.as_deref(), request.bind_ip)?;
     let profile = resolve_profile(&request.source_path)?;
 
@@ -64,6 +65,7 @@ pub fn start(request: LaunchRequest) -> Result<RuntimeSession, String> {
             request.ipxe_boot_file,
             network,
             profile,
+            request.autoinstall,
         ),
     }
 }
@@ -127,6 +129,55 @@ pub fn pxeasy_home_dir() -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .map(|home| home.join(".pxeasy"))
         .ok_or_else(|| "error: HOME is not set; cannot resolve ~/.pxeasy".to_string())
+}
+
+pub fn ensure_example_config() -> Result<(), String> {
+    let home = pxeasy_home_dir()?;
+    std::fs::create_dir_all(&home).map_err(|e| format!("error: failed to create home dir: {e}"))?;
+
+    let example_path = home.join("config.example.toml");
+    let content = r#"# pxeasy configuration example
+# Copy this to ~/.pxeasy/config.toml to customize your setup.
+
+# The network interface to bind to (e.g., "eth0", "en0").
+# interface = "en0"
+
+# The specific IPv4 address to bind services to.
+# bind_ip = "192.168.1.10"
+
+# The filename to serve for iPXE boot (advanced).
+# ipxe_boot_file = "boot.ipxe"
+
+# [autoinstall]
+# If true, pxeasy will automatically generate autoinstall scripts (like autounattend.xml)
+# for supported OSes if a custom one isn't found in ~/.pxeasy/<os>/autoinstall/.
+# enabled = true
+
+# The default user to create during installation (optional).
+# username = "pxeasy"
+
+# The password for the default user (optional).
+# password = "password"
+
+# The hostname for the installed system.
+# hostname = "pxeasy-vm"
+
+# [autoinstall.windows]
+# hostname = "win-lab"
+
+# Regional settings.
+language = "en-US"
+keyboard = "us"
+timezone = "UTC"
+
+# If true, the first disk found will be wiped and used for the installation.
+wipe_disk = true
+"#;
+
+    std::fs::write(&example_path, content)
+        .map_err(|e| format!("error: failed to write config.example.toml: {e}"))?;
+
+    Ok(())
 }
 
 fn resolve_profile(source_path: &Path) -> Result<BootProfile, String> {

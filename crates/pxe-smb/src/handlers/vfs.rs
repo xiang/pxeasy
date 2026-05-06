@@ -235,29 +235,14 @@ pub fn read_iso_range(
     }
 
     let normalized = normalize_iso_path(iso_path);
-    if let Ok(bytes) = load_file_range(source_path, &normalized, offset, length) {
-        return Ok(bytes);
-    }
-
     let iso_file_offset = if let Some(o) = cached_iso_offset {
         o
     } else if let Ok(slice) = load_file_slice(source_path, &normalized) {
         slice.offset
     } else {
-        let bytes = load_file(source_path, &normalized)
+        let bytes = load_file_range(source_path, &normalized, offset, length)
             .map_err(|err| io::Error::new(io::ErrorKind::NotFound, err.to_string()))?;
-        let start = usize::try_from(offset)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset too large"))?;
-        let end = start
-            .checked_add(length)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read length overflow"))?;
-        if end > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "read beyond end of file",
-            ));
-        }
-        return Ok(bytes[start..end].to_vec());
+        return Ok(bytes);
     };
 
     let abs_offset = iso_file_offset + offset;

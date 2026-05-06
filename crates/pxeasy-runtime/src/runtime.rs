@@ -83,4 +83,5 @@ pub struct LaunchRequest {
     pub interface: Option<String>,
     pub bind_ip: Option<Ipv4Addr>,
     pub ipxe_boot_file: Option<String>,
+    pub autoinstall: Option<pxe_autoinstall::AutoInstallConfig>,
 }

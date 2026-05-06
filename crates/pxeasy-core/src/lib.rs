@@ -38,6 +38,7 @@ pub struct LaunchRequest {
     pub interface: Option<String>,
     pub bind_ip: Option<Ipv4Addr>,
     pub ipxe_boot_file: Option<String>,
+    pub autoinstall: Option<pxe_autoinstall::AutoInstallConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,7 @@ impl AppController {
             interface: request.interface,
             bind_ip: request.bind_ip,
             ipxe_boot_file: request.ipxe_boot_file,
+            autoinstall: request.autoinstall,
         })?;
 
         let running_state =

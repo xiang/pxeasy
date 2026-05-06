@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 pxeasy-runtime = { path = "../pxeasy-runtime" }
+pxe-autoinstall = { path = "../pxe-autoinstall" }

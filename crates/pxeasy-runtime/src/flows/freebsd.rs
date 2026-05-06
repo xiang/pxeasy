@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
@@ -113,17 +114,36 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
         .as_secs();
 
     let arch_slug = arch.slug().unwrap_or("unknown");
-    let cache_dir = pxeasy_home_dir()?.join("freebsd");
+    let freebsd_dir = pxeasy_home_dir()?.join("freebsd");
+    let cache_dir = freebsd_dir.join("cache");
+    let assets_dir = freebsd_dir.join("assets");
+    let autoinstall_dir = freebsd_dir.join("autoinstall");
+
     fs::create_dir_all(&cache_dir)
         .map_err(|err| format!("error: failed to create FreeBSD cache dir: {err}"))?;
+    fs::create_dir_all(&assets_dir)
+        .map_err(|err| format!("error: failed to create FreeBSD assets dir: {err}"))?;
+    fs::create_dir_all(&autoinstall_dir)
+        .map_err(|err| format!("error: failed to create FreeBSD autoinstall dir: {err}"))?;
 
-    let cached_img = cache_dir.join(format!("freebsd-{}.img", arch_slug));
-    let cached_meta = cache_dir.join(format!("freebsd-{}.meta", arch_slug));
+    let default_loader_conf = "mfsroot_load=\"YES\"\nmfsroot_type=\"mfs_root\"\nmfsroot_name=\"/mfsroot\"\nvfs.root.mountfrom=\"ufs:/dev/md0\"\n".to_string();
+    let loader_conf_path = assets_dir.join("loader.conf");
+    if !loader_conf_path.exists() {
+        fs::write(&loader_conf_path, &default_loader_conf)
+            .map_err(|e| format!("error: failed to initialize FreeBSD loader.conf: {e}"))?;
+    }
+    let loader_conf = fs::read_to_string(&loader_conf_path)
+        .map_err(|e| format!("error: failed to read FreeBSD loader.conf: {e}"))?;
+
+    let source_hash = format!("{:016x}", stable_hash(&source_path.to_string_lossy()));
+    let cached_img = cache_dir.join(format!("freebsd-{}-{}.img", arch_slug, source_hash));
+    let cached_meta = cache_dir.join(format!("freebsd-{}-{}.meta", arch_slug, source_hash));
     let expected_meta = format!(
-        "format=uncompressed-mfsroot-v1\niso_size={}\niso_mtime={}\narch={}\n",
+        "format=uncompressed-mfsroot-v1\niso_size={}\niso_mtime={}\narch={}\nloader_conf_hash={:016x}\n",
         source_metadata.len(),
         modified_secs,
-        arch_slug
+        arch_slug,
+        stable_hash(&loader_conf),
     );
 
     if cached_img.exists() {
@@ -222,7 +242,6 @@ fn prepare_freebsd_mfs_image(source_path: &Path, arch: Architecture) -> Result<P
     fs::copy(&mfsroot_img, root_dir.join("mfsroot")).map_err(|e| e.to_string())?;
 
     // 5. Create custom loader.conf
-    let loader_conf = "mfsroot_load=\"YES\"\nmfsroot_type=\"mfs_root\"\nmfsroot_name=\"/mfsroot\"\nvfs.root.mountfrom=\"ufs:/dev/md0\"\n".to_string();
     let mut f = File::create(root_dir.join("boot/loader.conf")).map_err(|e| e.to_string())?;
     f.write_all(loader_conf.as_bytes())
         .map_err(|e| e.to_string())?;
@@ -360,6 +379,12 @@ fn dir_size(path: &Path) -> Result<u64, String> {
         }
     }
     Ok(size)
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub fn is_freebsd_boot_image(path: &Path) -> bool {
