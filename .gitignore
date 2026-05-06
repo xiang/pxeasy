@@ -10,8 +10,10 @@
 
 # local stuff
 .docs/
-STANDARDS.md
-
+.CLAUDE.md
+.AGENTS.md
+.agents
+.wiki
 /assets/
-
-
+/qemu-test/disks/
+/qemu-test/vars/

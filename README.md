@@ -33,7 +33,7 @@ Build the pxeasy binary:
 ```bash
 cargo build --release -p pxeasy
 ```
-To run it, either use the `just` commands defined in the `justfile` (which handle `sudo` automatically for the `run` command) or invoke the `qemu-scenario.sh` script.
+To run it, either use the `just` commands defined in the `justfile` (which handle `sudo` automatically for the `run` command) or invoke the `qemu-test/run` script.
 
 ## Usage
 
@@ -51,14 +51,14 @@ sudo pxeasy start Win11_English_x64.iso
 # Specify a network interface
 sudo pxeasy start --interface en0 ubuntu.iso
 ```
-It is recommended to use the `just` commands or the `qemu-scenario.sh` script for development and testing.
+It is recommended to use the `just` commands or the `qemu-test/run` script for development and testing.
 
 For local QEMU bring-up, use the shell runner:
 
 ```bash
-./scripts/qemu-scenario.sh list
-./scripts/qemu-scenario.sh run ubuntu-arm64-nfs
-./scripts/qemu-scenario.sh windows-arm64 assets/windows/Win11_25H2_English_Arm64_v2.iso
+./qemu-test/run list
+./qemu-test/run ubuntu-arm64-nfs
+WINDOWS_ISO=assets/windows/Win11_25H2_English_Arm64_v2.iso ./qemu-test/run windows-arm64
 ```
 
 ### How it Works

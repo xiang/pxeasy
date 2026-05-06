@@ -3019,6 +3019,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pxe-autoinstall"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "pxe-dhcp"
 version = "0.1.0"
 dependencies = [
@@ -3136,7 +3144,10 @@ dependencies = [
  "config",
  "ctrlc",
  "env_logger",
+ "libc",
+ "log",
  "pico-args",
+ "pxe-autoinstall",
  "pxeasy-core",
  "serde",
  "tempfile",
@@ -3146,6 +3157,7 @@ dependencies = [
 name = "pxeasy-core"
 version = "0.1.0"
 dependencies = [
+ "pxe-autoinstall",
  "pxeasy-runtime",
 ]
 
@@ -3166,6 +3178,7 @@ dependencies = [
  "flate2",
  "if-addrs",
  "log",
+ "pxe-autoinstall",
  "pxe-dhcp",
  "pxe-diskimg",
  "pxe-http",
