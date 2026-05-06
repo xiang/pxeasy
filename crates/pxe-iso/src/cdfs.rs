@@ -50,6 +50,37 @@ impl<R: cdfs::ISO9660Reader> SourceFs for CdfsIso<R> {
         }
     }
 
+    fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<Vec<u8>>, IsoError> {
+        match self
+            .iso
+            .open(path)
+            .map_err(|e| IsoError::InvalidData(e.to_string()))?
+        {
+            Some(DirectoryEntry::File(f)) => {
+                let header = f.header();
+                let file_len = u64::from(header.extent_length);
+                if offset >= file_len || length == 0 {
+                    return Ok(Some(Vec::new()));
+                }
+
+                let to_read = length.min(usize::try_from(file_len - offset).unwrap_or(usize::MAX));
+                let mut file = File::open(&self.path)?;
+                file.seek(SeekFrom::Start(
+                    u64::from(header.extent_loc) * 2048 + offset,
+                ))?;
+                let mut buf = vec![0u8; to_read];
+                file.read_exact(&mut buf)?;
+                Ok(Some(buf))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn path_exists(&self, path: &str) -> Result<bool, IsoError> {
         self.iso
             .open(path)

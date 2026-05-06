@@ -59,6 +59,12 @@ struct NodeDescriptor {
     allocation_descriptors_length: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RangeRequest {
+    offset: u64,
+    length: usize,
+}
+
 pub struct UdfIso {
     file: Mutex<File>,
     block_size: u32,
@@ -163,7 +169,10 @@ impl UdfIso {
         &self,
         icb: LongAllocationDescriptor,
     ) -> Result<NodeDescriptor, IsoError> {
-        let mut file = self.file.lock().unwrap();
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| IsoError::InvalidData("UDF file lock poisoned".to_string()))?;
         let offset = self.block_offset(icb.logical_block_num);
         file.seek(SeekFrom::Start(offset))?;
 
@@ -207,6 +216,56 @@ impl UdfIso {
             ALLOCATION_LONG => {
                 self.read_long_extents(&mut file, data, descriptor.information_length)
             }
+            other => Err(IsoError::InvalidData(format!(
+                "unsupported UDF allocation type: {other}"
+            ))),
+        }
+    }
+
+    fn read_node_data_range(
+        &self,
+        icb: LongAllocationDescriptor,
+        descriptor: NodeDescriptor,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, IsoError> {
+        if offset >= descriptor.information_length || length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let readable = descriptor.information_length - offset;
+        let length = length.min(usize::try_from(readable).unwrap_or(usize::MAX));
+
+        let mut file = self.file.lock().unwrap();
+        let node_offset = self.block_offset(icb.logical_block_num);
+        file.seek(SeekFrom::Start(node_offset))?;
+
+        let mut block = vec![0u8; self.block_size as usize];
+        file.read_exact(&mut block)?;
+
+        let data = block
+            .get(
+                descriptor.allocation_descriptors_offset
+                    ..descriptor.allocation_descriptors_offset
+                        + descriptor.allocation_descriptors_length,
+            )
+            .ok_or_else(|| {
+                IsoError::InvalidData("UDF allocation descriptors exceed node size".to_string())
+            })?;
+
+        match descriptor.allocation_type {
+            ALLOCATION_EMBEDDED => {
+                let start = usize::try_from(offset).map_err(|_| {
+                    IsoError::InvalidData("UDF embedded file offset too large".to_string())
+                })?;
+                if start >= data.len() {
+                    return Ok(Vec::new());
+                }
+                let end = start.saturating_add(length).min(data.len());
+                Ok(data[start..end].to_vec())
+            }
+            ALLOCATION_SHORT => self.read_short_extents_range(&mut file, data, offset, length),
+            ALLOCATION_LONG => self.read_long_extents_range(&mut file, data, offset, length),
             other => Err(IsoError::InvalidData(format!(
                 "unsupported UDF allocation type: {other}"
             ))),
@@ -267,6 +326,112 @@ impl UdfIso {
         Ok(out)
     }
 
+    fn read_short_extents_range(
+        &self,
+        file: &mut File,
+        descriptors: &[u8],
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, IsoError> {
+        let mut out = Vec::with_capacity(length);
+        let mut logical_pos = 0u64;
+        for chunk in descriptors.chunks_exact(8) {
+            let extent_length = le_u32(chunk, 0).map_err(IsoError::Io)?;
+            if extent_length == 0 {
+                break;
+            }
+
+            let extent_len = u64::from(extent_length & 0x3FFF_FFFF);
+            let block_num = le_u32(chunk, 4).map_err(IsoError::Io)?;
+            self.read_extent_range(
+                file,
+                block_num,
+                extent_len,
+                logical_pos,
+                RangeRequest { offset, length },
+                &mut out,
+            )?;
+            if out.len() >= length {
+                break;
+            }
+            logical_pos = logical_pos.saturating_add(extent_len);
+        }
+
+        Ok(out)
+    }
+
+    fn read_long_extents_range(
+        &self,
+        file: &mut File,
+        descriptors: &[u8],
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, IsoError> {
+        let mut out = Vec::with_capacity(length);
+        let mut logical_pos = 0u64;
+        for chunk in descriptors.chunks_exact(16) {
+            let ad = parse_long_ad(chunk).map_err(IsoError::Io)?;
+            let extent_len = ad.length() as u64;
+            if extent_len == 0 {
+                break;
+            }
+            if ad.partition_ref_num != 0 {
+                return Err(IsoError::InvalidData(format!(
+                    "unsupported UDF partition reference: {}",
+                    ad.partition_ref_num
+                )));
+            }
+
+            self.read_extent_range(
+                file,
+                ad.logical_block_num,
+                extent_len,
+                logical_pos,
+                RangeRequest { offset, length },
+                &mut out,
+            )?;
+            if out.len() >= length {
+                break;
+            }
+            logical_pos = logical_pos.saturating_add(extent_len);
+        }
+
+        Ok(out)
+    }
+
+    fn read_extent_range(
+        &self,
+        file: &mut File,
+        block_num: u32,
+        extent_len: u64,
+        logical_pos: u64,
+        request: RangeRequest,
+        out: &mut Vec<u8>,
+    ) -> Result<(), IsoError> {
+        if logical_pos.saturating_add(extent_len) <= request.offset {
+            return Ok(());
+        }
+        let wanted_end = request.offset.saturating_add(request.length as u64);
+        if logical_pos >= wanted_end {
+            return Ok(());
+        }
+
+        let start_in_extent = request.offset.saturating_sub(logical_pos);
+        let end_in_extent = wanted_end.saturating_sub(logical_pos).min(extent_len);
+        if end_in_extent <= start_in_extent {
+            return Ok(());
+        }
+
+        let bytes_to_read = usize::try_from(end_in_extent - start_in_extent)
+            .map_err(|_| IsoError::InvalidData("UDF range read length too large".to_string()))?;
+        let absolute_offset = self.block_offset(block_num).saturating_add(start_in_extent);
+        file.seek(SeekFrom::Start(absolute_offset))?;
+        let start = out.len();
+        out.resize(start + bytes_to_read, 0);
+        file.read_exact(&mut out[start..])?;
+        Ok(())
+    }
+
     fn read_extent(
         &self,
         file: &mut File,
@@ -316,6 +481,28 @@ impl SourceFs for UdfIso {
         self.read_node_data(entry.icb, descriptor).map(Some)
     }
 
+    fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<Vec<u8>>, IsoError> {
+        let Some(entry) = self.resolve_path(path)? else {
+            return Ok(None);
+        };
+        if entry.is_directory {
+            return Ok(None);
+        }
+
+        let descriptor = self.read_node_descriptor(entry.icb)?;
+        if descriptor.file_type != FILE_TYPE_REGULAR {
+            return Ok(None);
+        }
+
+        self.read_node_data_range(entry.icb, descriptor, offset, length)
+            .map(Some)
+    }
+
     fn path_exists(&self, path: &str) -> Result<bool, IsoError> {
         Ok(self.resolve_path(path)?.is_some())
     }
@@ -345,6 +532,22 @@ impl SourceFs for UdfIso {
         // LongAllocationDescriptor doesn't easily translate to a single contiguous byte slice
         // since UDF files can be fragmented. For simplicity in detection, we return None.
         Ok(None)
+    }
+
+    fn file_size(&self, path: &str) -> Result<Option<u64>, IsoError> {
+        let Some(entry) = self.resolve_path(path)? else {
+            return Ok(None);
+        };
+        if entry.is_directory {
+            return Ok(None);
+        }
+
+        let descriptor = self.read_node_descriptor(entry.icb)?;
+        if descriptor.file_type != FILE_TYPE_REGULAR {
+            return Ok(None);
+        }
+
+        Ok(Some(descriptor.information_length))
     }
 
     fn volume_label(&self) -> Option<String> {

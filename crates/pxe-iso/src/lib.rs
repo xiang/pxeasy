@@ -89,10 +89,19 @@ impl ExtractionProgress {
 
 pub trait SourceFs {
     fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>, IsoError>;
+    fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<Vec<u8>>, IsoError>;
     fn path_exists(&self, path: &str) -> Result<bool, IsoError>;
     fn list_files(&self, prefix: &str) -> Result<Vec<String>, IsoError>;
     fn list_dir(&self, dir_path: &str) -> Result<Vec<(String, bool)>, IsoError>;
     fn file_slice(&self, path: &str) -> Result<Option<IsoSlice>, IsoError>;
+    fn file_size(&self, path: &str) -> Result<Option<u64>, IsoError> {
+        Ok(self.file_slice(path)?.map(|slice| slice.length))
+    }
     fn volume_label(&self) -> Option<String>;
 
     fn extract_to(&self, dest: &Path) -> Result<(), IsoError> {

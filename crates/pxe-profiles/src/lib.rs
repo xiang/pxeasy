@@ -182,13 +182,8 @@ pub fn load_file_range(
         Err(_) => Box::new(CdfsIso::open(source_path)?),
     };
 
-    if let Some(content) = source.read_file(file_path)? {
-        let start = offset as usize;
-        let end = (start + length).min(content.len());
-        if start >= content.len() {
-            return Ok(Vec::new());
-        }
-        return Ok(content[start..end].to_vec());
+    if let Some(content) = source.read_file_range(file_path, offset, length)? {
+        return Ok(content);
     }
 
     Err(ProfileError::MissingFile {
@@ -216,6 +211,17 @@ pub fn list_files(source_path: &Path, prefix: &str) -> Result<Vec<String>, Profi
 pub fn build_metadata_map(
     source_path: &Path,
 ) -> Result<HashMap<String, IsoEntryMeta>, ProfileError> {
+    let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
+        Ok(source) => Box::new(source),
+        Err(_) => Box::new(CdfsIso::open(source_path)?),
+    };
+
+    build_metadata_map_from_source(source.as_ref())
+}
+
+fn build_metadata_map_from_source(
+    source: &dyn SourceFs,
+) -> Result<HashMap<String, IsoEntryMeta>, ProfileError> {
     let mut map = HashMap::new();
     map.insert(
         "/".to_string(),
@@ -227,28 +233,54 @@ pub fn build_metadata_map(
         },
     );
 
-    let source: Box<dyn SourceFs> = match UdfIso::open(source_path) {
-        Ok(source) => Box::new(source),
-        Err(_) => Box::new(CdfsIso::open(source_path)?),
-    };
-
-    let files = source.list_files("/")?;
-    for path in files {
-        let normalized = normalize_path(&path);
-        let display_name = normalized.rsplit('/').next().unwrap_or("").to_string();
-        let slice = source.file_slice(&path)?;
-        map.insert(
-            normalized.to_ascii_lowercase(),
-            IsoEntryMeta {
-                is_dir: false,
-                size: slice.as_ref().map(|s| s.length).unwrap_or(0),
-                iso_offset: slice.as_ref().map(|s| s.offset),
-                display_name,
-            },
-        );
-    }
+    add_metadata_entries(source, "/", &mut map)?;
 
     Ok(map)
+}
+
+fn add_metadata_entries(
+    source: &dyn SourceFs,
+    dir_path: &str,
+    map: &mut HashMap<String, IsoEntryMeta>,
+) -> Result<(), ProfileError> {
+    for (name, is_dir) in source.list_dir(dir_path)? {
+        let path = if dir_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir_path}/{name}")
+        };
+        let normalized = normalize_path(&path);
+
+        if is_dir {
+            map.insert(
+                normalized.to_ascii_lowercase(),
+                IsoEntryMeta {
+                    is_dir: true,
+                    size: 0,
+                    iso_offset: None,
+                    display_name: name,
+                },
+            );
+            add_metadata_entries(source, &normalized, map)?;
+        } else {
+            let slice = source.file_slice(&normalized)?;
+            let size = source
+                .file_size(&normalized)?
+                .or_else(|| slice.as_ref().map(|s| s.length))
+                .unwrap_or(0);
+            map.insert(
+                normalized.to_ascii_lowercase(),
+                IsoEntryMeta {
+                    is_dir: false,
+                    size,
+                    iso_offset: slice.as_ref().map(|s| s.offset),
+                    display_name: name,
+                },
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub fn load_all_files(source_path: &Path) -> Result<HashMap<String, Vec<u8>>, ProfileError> {
@@ -320,6 +352,25 @@ impl SourceFs for MemorySourceFs {
         Ok(self.files.get(&normalize_path(path)).cloned())
     }
 
+    fn read_file_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<Vec<u8>>, IsoError> {
+        let Some(content) = self.files.get(&normalize_path(path)) else {
+            return Ok(None);
+        };
+        let Ok(start) = usize::try_from(offset) else {
+            return Ok(Some(Vec::new()));
+        };
+        if start >= content.len() {
+            return Ok(Some(Vec::new()));
+        }
+        let end = start.saturating_add(length).min(content.len());
+        Ok(Some(content[start..end].to_vec()))
+    }
+
     fn path_exists(&self, path: &str) -> Result<bool, IsoError> {
         let normalized = normalize_path(path);
         Ok(self.files.contains_key(&normalized) || self.dirs.contains(&normalized))
@@ -371,6 +422,13 @@ impl SourceFs for MemorySourceFs {
 
     fn file_slice(&self, _path: &str) -> Result<Option<IsoSlice>, IsoError> {
         Ok(None)
+    }
+
+    fn file_size(&self, path: &str) -> Result<Option<u64>, IsoError> {
+        Ok(self
+            .files
+            .get(&normalize_path(path))
+            .map(|bytes| bytes.len() as u64))
     }
 
     fn volume_label(&self) -> Option<String> {
@@ -686,8 +744,7 @@ mod tests {
     fn ubuntu_missing_initrd_returns_missing_file_error() {
         let iso = MockSource::new()
             .with_file("/.disk/info", b"Ubuntu 24.04 LTS")
-            .with_file("/casper/vmlinuz", b"")
-            .with_file("/casper/initrd", b"");
+            .with_file("/casper/vmlinuz", b"");
         // /casper/initrd absent
 
         let err = detect_from_source(&iso, None, None).unwrap_err();
@@ -827,5 +884,33 @@ mod tests {
             panic!("expected BootProfile::Windows");
         };
         assert_eq!(profile.architecture, Architecture::Amd64);
+    }
+
+    #[test]
+    fn metadata_map_uses_file_size_when_slice_is_unavailable() {
+        let source = MockSource::new().with_file("/setup.exe", b"not empty");
+
+        let map = build_metadata_map_from_source(&source).unwrap();
+        let meta = map.get("/setup.exe").unwrap();
+
+        assert_eq!(meta.size, 9);
+        assert_eq!(meta.iso_offset, None);
+        assert_eq!(meta.display_name, "setup.exe");
+    }
+
+    #[test]
+    fn metadata_map_contains_directories_for_nested_files() {
+        let source = MockSource::new()
+            .with_file("/setup.exe", b"")
+            .with_file("/sources/setuphost.exe", b"host");
+
+        let map = build_metadata_map_from_source(&source).unwrap();
+        let dir = map.get("/sources").unwrap();
+        let file = map.get("/sources/setuphost.exe").unwrap();
+
+        assert!(dir.is_dir);
+        assert_eq!(dir.display_name, "sources");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 4);
     }
 }
